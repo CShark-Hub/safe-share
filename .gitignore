@@ -1,0 +1,41 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Safe Share: never commit captured pixels or recognized text.
+# Debug dumps are opt-in only (see CLAUDE.md privacy rule 6).
+debug_dumps/
+captures/
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.mov
+*.mp4
+!docs/**/*.png
+
+# Local env / secrets
+.env
+.env.*

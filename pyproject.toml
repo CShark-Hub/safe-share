@@ -1,0 +1,22 @@
+[project]
+name = "safe-share"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Krzysiek Kulig" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pyobjc-framework-cocoa>=12.2.2",
+    "pyobjc-framework-quartz>=12.2.2",
+    "pyobjc-framework-screencapturekit>=12.2.2",
+    "pyobjc-framework-vision>=12.2.2",
+]
+
+[project.scripts]
+safe-share = "safe_share:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
