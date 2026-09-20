@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -70,7 +71,15 @@ class RecordingPublisher:
         self.neutrals.append(epoch)
 
 
-def _pipeline(recognizer, terms: list[str] | None = None):
+class FakeClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _pipeline(recognizer, terms: list[str] | None = None, **kwargs):
     state = SessionState()
     publisher = RecordingPublisher()
     pipeline = FramePipeline(
@@ -78,6 +87,7 @@ def _pipeline(recognizer, terms: list[str] | None = None):
         RuleDetector(RuleConfig(terms=terms or [])),
         publisher,
         state,
+        **kwargs,
     )
     return pipeline, publisher, state
 
@@ -252,6 +262,169 @@ def test_worker_death_survives_a_publisher_that_also_fails_on_neutral():
     # recognized text.
     assert escaped == []
     assert state.stopped is True
+
+
+def test_watchdog_fires_neutral_and_stops_when_output_stalls():
+    clock = FakeClock()
+    pipeline, publisher, state = _pipeline(
+        BlockingRecognizer(),
+        watchdog_timeout=2.0,
+        watchdog_first_frame=2.0,
+        monotonic=clock,
+    )
+    state.go_live()
+
+    live = pipeline._watchdog_tick(False)  # live edge: baseline at t=0
+    assert live is True
+    clock.t = 1.0
+    assert pipeline._watchdog_tick(True) is True  # within timeout
+    clock.t = 3.0
+    assert pipeline._watchdog_tick(True) is False  # gap exceeded
+
+    assert pipeline.watchdog_fired == 1
+    assert publisher.neutrals != []
+    assert state.stopped is True
+
+
+def test_watchdog_does_not_fire_while_paused():
+    clock = FakeClock()
+    pipeline, _, state = _pipeline(
+        FakeRecognizer(),
+        watchdog_timeout=2.0,
+        watchdog_first_frame=2.0,
+        monotonic=clock,
+    )
+    state.go_live()
+    pipeline.process(_frame(), 1, state.epoch)  # first publish ends the grace
+
+    was_live = pipeline._watchdog_tick(False)  # live, baseline at t=0
+    clock.t = 1.0
+    was_live = pipeline._watchdog_tick(was_live)  # live, near firing, no fire
+    assert was_live is True
+    state.pause()
+    for t in (3.0, 6.0):  # well past the timeout, but paused
+        clock.t = t
+        was_live = pipeline._watchdog_tick(was_live)
+
+    assert pipeline.watchdog_fired == 0
+    assert state.stopped is False
+
+
+def test_watchdog_gives_the_first_frame_a_wider_budget():
+    clock = FakeClock()
+    pipeline, publisher, state = _pipeline(
+        BlockingRecognizer(),
+        watchdog_timeout=2.0,
+        watchdog_first_frame=10.0,
+        monotonic=clock,
+    )
+    state.go_live()
+
+    pipeline._watchdog_tick(False)  # baseline, first-frame budget armed
+    clock.t = 5.0  # past the 2s steady timeout, under the 10s first-frame grace
+    assert pipeline._watchdog_tick(True) is True
+    assert pipeline.watchdog_fired == 0
+    clock.t = 11.0  # now past the first-frame grace
+    assert pipeline._watchdog_tick(True) is False
+    assert publisher.neutrals != []
+
+
+def test_watchdog_narrows_to_steady_timeout_after_first_publish():
+    clock = FakeClock()
+    pipeline, publisher, state = _pipeline(
+        FakeRecognizer(),
+        watchdog_timeout=2.0,
+        watchdog_first_frame=10.0,
+        monotonic=clock,
+    )
+    state.go_live()
+    pipeline._watchdog_tick(False)  # live edge: first-frame budget armed
+    pipeline.process(_frame(), 1, state.epoch)  # publishes, ends the grace
+
+    clock.t = 3.0  # past the 2s steady timeout, under the 10s first-frame grace
+    assert pipeline._watchdog_tick(True) is False  # steady budget now applies
+    assert pipeline.watchdog_fired == 1
+    assert publisher.neutrals != []
+
+
+def test_watchdog_loop_fires_through_the_real_thread():
+    """Exercises _watchdog_loop, run()'s start/join, and was_live threading with
+    a real worker and real (short) timings — no fake clock."""
+    recognizer = BlockingRecognizer()
+    pipeline, publisher, state = _pipeline(
+        recognizer, watchdog_timeout=0.3, watchdog_first_frame=0.3, watchdog_poll=0.02
+    )
+    state.go_live()
+    pipeline.submit(_frame())
+    worker = _run_in_thread(pipeline)
+    assert recognizer.entered.wait(5)
+
+    deadline = time.monotonic() + 5
+    while not publisher.neutrals and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert publisher.neutrals != []
+    assert state.stopped is True
+    recognizer.release.set()
+    worker.join(5)
+    assert publisher.frames == []
+
+
+def test_progress_resets_on_the_live_edge_after_resume():
+    clock = FakeClock()
+    pipeline, _, state = _pipeline(
+        FakeRecognizer(), watchdog_timeout=2.0, monotonic=clock
+    )
+    state.go_live()
+    clock.t = 10.0  # a long pause elapses on the clock
+    state.pause()
+    state.go_live()
+
+    assert pipeline._watchdog_tick(False) is True  # resume edge rebaselines
+    clock.t = 11.0
+    assert pipeline._watchdog_tick(True) is True  # not the 10s pause gap
+    assert pipeline.watchdog_fired == 0
+
+
+def test_republish_resets_the_watchdog_gap():
+    clock = FakeClock()
+    pipeline, _, state = _pipeline(
+        FakeRecognizer(), watchdog_timeout=2.0, monotonic=clock
+    )
+    state.go_live()
+    pipeline.process(_frame(), 1, state.epoch)  # first OCR, marks progress
+    clock.t = 1.5
+    pipeline.process(_frame(), 2, state.epoch)  # republish, marks progress again
+    clock.t = 3.0  # 1.5s since the republish, under the 2s timeout
+
+    assert pipeline._watchdog_tick(True) is True
+    assert pipeline.watchdog_fired == 0
+
+
+def test_hung_worker_publishes_nothing_after_the_watchdog_fires():
+    """The un-hang guarantee: a frame that finishes OCR after the watchdog has
+    stopped the session is dropped, not published over neutral."""
+    clock = FakeClock()
+    recognizer = BlockingRecognizer()
+    pipeline, publisher, state = _pipeline(
+        recognizer,
+        watchdog_timeout=2.0,
+        watchdog_first_frame=2.0,
+        monotonic=clock,
+    )
+    state.go_live()
+    pipeline.submit(_frame())
+    worker = _run_in_thread(pipeline)
+    assert recognizer.entered.wait(5)  # worker is inside recognize()
+
+    pipeline._watchdog_tick(False)
+    clock.t = 3.0
+    pipeline._watchdog_tick(True)  # fires: stop + neutral
+    recognizer.release.set()  # worker un-hangs and tries to publish
+    worker.join(5)
+
+    assert publisher.frames == []
+    assert pipeline.dropped_epoch == 1
 
 
 def test_published_frame_is_masked():

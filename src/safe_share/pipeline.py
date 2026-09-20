@@ -8,11 +8,14 @@ Invariants:
   - pause, resume and stop bump the epoch; a frame stamped with an older epoch
     is dropped, and the skip cache resets when the epoch changes
   - any OCR/detect/render failure publishes neutral, never a raw frame
+  - if output stalls while live (a hang or silent capture stall), a watchdog
+    thread stops the session and publishes neutral
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from typing import Protocol
 
@@ -29,6 +32,15 @@ _SIG_DIFF_THRESH = 4.0
 # Force a full re-OCR at least this often so a comparator miss cannot freeze the
 # output indefinitely while the real screen moves on.
 _MAX_SKIP_FRAMES = 15
+
+# Watchdog: while live, if nothing has reached the screen for this long (an OCR
+# hang, or capture silently stalling), fall to neutral. Placeholder values; set
+# them from a measured process() p95 on a real capture run.
+_WATCHDOG_TIMEOUT = 2.0
+_WATCHDOG_POLL = 0.25
+# The first frame after start/resume gets a wider budget: a cold Vision request
+# (model warm-up) can take several seconds without anything being wrong.
+_WATCHDOG_FIRST_FRAME = 10.0
 
 
 class Recognizer(Protocol):
@@ -132,12 +144,20 @@ class FramePipeline:
         publisher: Publisher,
         state: SessionState,
         on_error: Callable[[str], None] | None = None,
+        watchdog_timeout: float = _WATCHDOG_TIMEOUT,
+        watchdog_poll: float = _WATCHDOG_POLL,
+        watchdog_first_frame: float = _WATCHDOG_FIRST_FRAME,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._recognizer = recognizer
         self._detector = detector
         self._publisher = publisher
         self._state = state
         self._on_error = on_error
+        self._watchdog_timeout = watchdog_timeout
+        self._watchdog_poll = watchdog_poll
+        self._watchdog_first_frame = watchdog_first_frame
+        self._monotonic = monotonic
 
         self._slot_lock = threading.Lock()
         self._pending: tuple[np.ndarray, int, int] | None = None
@@ -151,6 +171,13 @@ class FramePipeline:
         self._last_epoch: int | None = None
         self._skips = 0  # consecutive republishes, capped by _MAX_SKIP_FRAMES
 
+        # Time of the last output that reached the screen; the watchdog measures
+        # the gap since. `_first_frame` widens the budget until the first publish
+        # after a live edge. Both guarded by _progress_lock (worker + watchdog).
+        self._progress_lock = threading.Lock()
+        self._last_progress = self._monotonic()
+        self._first_frame = True
+
         # Counts only: no frame content and no recognized text.
         self.dropped_stale = 0
         self.dropped_not_live = 0
@@ -158,6 +185,7 @@ class FramePipeline:
         self.published = 0
         self.republished = 0
         self.failed = 0
+        self.watchdog_fired = 0
 
     def submit(self, frame: np.ndarray) -> int:
         """Newest frame wins; an unprocessed older one is dropped.
@@ -196,7 +224,62 @@ class FramePipeline:
             self._pending = None
             return pending
 
+    def _mark_progress(self, now: float | None = None) -> None:
+        """Record that output reached the screen; a real publish also ends the
+        first-frame grace."""
+        with self._progress_lock:
+            self._last_progress = self._monotonic() if now is None else now
+            self._first_frame = False
+
+    def _watchdog_tick(self, was_live: bool) -> bool:
+        """One watchdog check. Returns whether the session is live afterwards.
+
+        Extracted from the loop so it runs deterministically under a fake clock.
+        """
+        now = self._monotonic()
+        live = self._state.live
+        if live and not was_live:
+            # Live edge (start/resume): restart the clock and re-arm the wider
+            # first-frame budget so a cold OCR or a pause's duration cannot fire.
+            with self._progress_lock:
+                self._last_progress = now
+                self._first_frame = True
+            return True
+        with self._progress_lock:
+            gap = now - self._last_progress
+            budget = (
+                self._watchdog_first_frame
+                if self._first_frame
+                else self._watchdog_timeout
+            )
+        if live and gap > budget:
+            self._trigger_watchdog()
+            return False
+        return live
+
+    def _trigger_watchdog(self) -> None:
+        # A hung worker cannot be cancelled from Python: make the output safe and
+        # abandon the thread. stop() is terminal, so the thread's eventual late
+        # publish is dropped at the epoch gate.
+        self.watchdog_fired += 1
+        self._state.stop()
+        self._shutdown.set()
+        self._ready.set()  # release a merely-stalled (not hung) worker
+        try:
+            if self._on_error is not None:
+                self._on_error("watchdog")
+            self._publisher.publish_neutral(self._state.epoch)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    def _watchdog_loop(self) -> None:
+        was_live = False
+        while not self._shutdown.wait(self._watchdog_poll):
+            was_live = self._watchdog_tick(was_live)
+
     def run(self) -> None:
+        watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+        watchdog.start()
         try:
             while not self._shutdown.is_set():
                 if not self._ready.wait(0.5):
@@ -223,6 +306,9 @@ class FramePipeline:
                 self._publisher.publish_neutral(self._state.epoch)
             except Exception:  # noqa: BLE001, S110
                 pass
+        finally:
+            self._shutdown.set()
+            watchdog.join(timeout=1.0)
 
     def process(self, frame: np.ndarray, seq: int, epoch: int) -> None:
         """Run one captured frame end to end. `epoch` is its capture-time stamp."""
@@ -268,6 +354,7 @@ class FramePipeline:
                 self._on_error(type(exc).__name__)
             if self._state.accepts(epoch):
                 self._publisher.publish_neutral(epoch)
+                self._mark_progress()
             else:
                 self.dropped_epoch += 1
             return
@@ -284,4 +371,5 @@ class FramePipeline:
             self.dropped_epoch += 1
             return False
         self._publisher.publish(epoch, seq, masked)
+        self._mark_progress()
         return True
