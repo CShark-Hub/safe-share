@@ -1,9 +1,8 @@
-"""Step 1 spike: live display capture with one hardcoded mask, shown in an
-AppKit window Teams can share, plus a separate Pause/Resume/Stop window.
+"""Live display capture, redacted and shown in an AppKit window Teams can
+share, plus a separate Pause/Resume/Stop window.
 
-Invariants: only a masked frame is ever shown; before the first frame and on
-pause/stop/error the window shows a neutral screen; an epoch drops in-flight
-frames so a late one cannot overwrite neutral.
+Scheduling and the privacy invariants live in `pipeline.py`; this module is the
+AppKit publisher and the window/control wiring.
 
 Run:  python -m safe_share.spike   (needs Screen Recording permission)
 """
@@ -31,7 +30,7 @@ from AppKit import (
     NSWindowStyleMaskMiniaturizable,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSObject
+from Foundation import NSData, NSObject
 from PyObjCTools import AppHelper
 from Quartz import CATransaction
 
@@ -39,42 +38,29 @@ from .capture import CaptureError, DisplayCapture
 from .config import load_rule_config
 from .detect import RuleConfig, RuleDetector
 from .ocr import TextRecognizer
-from .redact import redact
+from .pipeline import FramePipeline, SessionState
 
 _NEUTRAL_RGBA = (0.10, 0.10, 0.10, 1.0)
 
-# Unchanged-frame skip: re-OCR'ing identical pixels wastes the frame budget.
-_SIG_SIZE = 64
-_SIG_DIFF_THRESH = 2.0
 
-
-def _frame_signature(frame: np.ndarray) -> np.ndarray:
-    """Cheap luma thumbnail for change detection (subsample + channel mean)."""
-    h, w = frame.shape[:2]
-    sy, sx = max(1, h // _SIG_SIZE), max(1, w // _SIG_SIZE)
-    return frame[::sy, ::sx, :3].mean(axis=2).astype(np.float32)
-
-
-def _unchanged(a: np.ndarray | None, b: np.ndarray) -> bool:
-    """True if `b` matches the last processed signature `a` within threshold.
-    Threshold ignores cursor blink; a real change re-triggers OCR."""
-    return (
-        a is not None
-        and a.shape == b.shape
-        and float(np.abs(a - b).mean()) < (_SIG_DIFF_THRESH)
-    )
+def should_deliver(accepted: bool, seq: int, last_seq: int) -> bool:
+    """Gate for a masked frame on the main thread: current epoch, and newer than
+    whatever is already on screen."""
+    return accepted and seq > last_seq
 
 
 def _cgimage_from_bgra(arr: np.ndarray):
-    """Build a CGImage from a BGRA array; returns (cgimage, arr).
+    """Build a CGImage owning a copy of a BGRA array.
 
-    The provider does not copy, so `arr` is returned to be pinned alive for as
-    long as the CGImage is referenced.
+    The NSData copy makes the pixel lifetime the CGImage's own; a no-copy
+    provider would leave Core Animation reading an array Python may free.
     """
     arr = np.ascontiguousarray(arr)
     h, w = arr.shape[:2]
     stride = arr.strides[0]
-    provider = Quartz.CGDataProviderCreateWithData(None, arr, arr.nbytes, None)
+    provider = Quartz.CGDataProviderCreateWithCFData(
+        NSData.dataWithBytes_length_(arr, arr.nbytes)
+    )
     cs = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)  # match capture
     info = Quartz.kCGBitmapByteOrder32Little | Quartz.kCGImageAlphaNoneSkipFirst
     cg = Quartz.CGImageCreate(
@@ -90,83 +76,65 @@ def _cgimage_from_bgra(arr: np.ndarray):
         False,
         Quartz.kCGRenderingIntentDefault,
     )
-    return cg, arr
+    return cg
 
 
-class Presenter(NSObject):
-    """Publishes frames or the neutral screen to the layer, main thread only.
+class LayerPresenter:
+    """Publishes frames or the neutral screen to a CALayer.
 
-    Only frames stamped with the current epoch are published; pause/stop bump
-    the epoch to invalidate in-flight frames.
+    `publish`/`publish_neutral` are called from the worker thread and hop to the
+    main thread; the layer is never touched off it.
     """
 
-    def initWithLayer_(self, layer):
-        self = objc.super(Presenter, self).init()
-        if self is None:
-            return None
+    def __init__(self, layer, state: SessionState) -> None:
         self._layer = layer
-        self._epoch = 0
-        self._live = False
-        self._stopped = False
-        # Guards _epoch/_live/_stopped, read on the worker thread and mutated
-        # on the main thread.
-        self._state_lock = threading.Lock()
-        self._pinned = None  # keeps the current frame's array alive
-        self._show_neutral()
-        return self
+        self._state = state
+        self._last_seq = 0
+        self._cache_frame = None
+        self._cache_cg = None
+        self.show_neutral()
 
-    def goLive(self):
-        with self._state_lock:
-            if self._stopped:
-                return  # Stop is terminal; Resume cannot revive the session.
-            self._live = True
+    def publish(self, epoch: int, seq: int, frame: np.ndarray) -> None:
+        if not self._state.accepts(epoch):
+            return
+        AppHelper.callAfter(self._deliver, epoch, seq, frame)
 
-    def pause(self):
-        with self._state_lock:
-            self._epoch += 1
-            self._live = False
-        self._show_neutral()
+    def publish_neutral(self, epoch: int) -> None:
+        AppHelper.callAfter(self._deliver_neutral, epoch)
 
-    def stop(self):
-        with self._state_lock:
-            self._epoch += 1
-            self._live = False
-            self._stopped = True
-        self._show_neutral()
-
-    def currentEpoch(self) -> int:
-        with self._state_lock:
-            return self._epoch
-
-    def publishPayload_(self, payload):
-        """payload = (epoch, cgimage, pinned_array), main thread."""
-        epoch, cg, pinned = payload
-        with self._state_lock:
-            drop = self._stopped or not self._live or epoch != self._epoch
-        if drop:
-            return  # stale or paused/stopped: never overwrite neutral
+    def _deliver(self, epoch: int, seq: int, frame: np.ndarray) -> None:
+        if not should_deliver(self._state.accepts(epoch), seq, self._last_seq):
+            return  # stale, paused or stopped: never overwrite neutral
+        cg = self._cgimage_for(frame)
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
         self._layer.setContents_(cg)
         CATransaction.commit()
-        self._pinned = pinned
+        self._last_seq = seq
 
-    def publishNeutralForEpoch_(self, epoch):
-        """Neutral for a failed frame; ignored if stale or paused/stopped."""
-        with self._state_lock:
-            drop = self._stopped or not self._live or epoch != self._epoch
-        if drop:
+    def _deliver_neutral(self, epoch: int) -> None:
+        # Neutral is always safe to show; only a stale failure from an earlier
+        # epoch is ignored, so it cannot blank a good frame after a resume.
+        if self._state.live and epoch != self._state.epoch:
             return
-        self._show_neutral()
+        self.show_neutral()
 
-    def _show_neutral(self):
+    def _cgimage_for(self, frame: np.ndarray):
+        if frame is self._cache_frame:  # republished unchanged frame
+            return self._cache_cg
+        cg = _cgimage_from_bgra(frame)
+        self._cache_frame, self._cache_cg = frame, cg
+        return cg
+
+    def show_neutral(self) -> None:
         r, g, b, a = _NEUTRAL_RGBA
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
         self._layer.setContents_(None)
         self._layer.setBackgroundColor_(Quartz.CGColorCreateGenericRGB(r, g, b, a))
         CATransaction.commit()
-        self._pinned = None
+        self._cache_frame = None
+        self._cache_cg = None
 
 
 class Controls(NSObject):
@@ -191,105 +159,72 @@ class Controls(NSObject):
 
 
 class SafeShareSpike:
-    """Wires capture, worker, presenter and controls into one running app."""
+    """Wires capture, pipeline, presenter and controls into one running app."""
 
     def __init__(self) -> None:
         self._app = None
-        self._presenter = None
+        self._presenter: LayerPresenter | None = None
         self._controls_target = None
         self._output_window = None
         self._controls_window = None
-        self._capture = None
+        self._capture: DisplayCapture | None = None
         self._rule_config = RuleConfig()
-
-        # Latest-frame slot: newest raw frame wins, older pending ones drop.
-        self._slot_lock = threading.Lock()
-        self._latest_frame = None
-        self._frame_ready = threading.Event()
-        self._worker_stop = threading.Event()
-        self._worker = None
+        self._state = SessionState()
+        self._pipeline: FramePipeline | None = None
+        self._worker: threading.Thread | None = None
 
     def _on_frame(self, frame: np.ndarray) -> None:
-        with self._slot_lock:
-            self._latest_frame = frame
-        self._frame_ready.set()
+        if self._pipeline is not None:
+            self._pipeline.submit(frame)
 
     def _on_stop(self, message: str) -> None:
         print(f"[capture] {message}", file=sys.stderr)
-        self._worker_stop.set()
-        AppHelper.callAfter(self._presenter.stop)
+        self._state.stop()  # before shutdown: no in-flight frame may publish
+        if self._pipeline is not None:
+            self._pipeline.shutdown()
+        if self._presenter is not None:
+            AppHelper.callAfter(self._presenter.show_neutral)
 
-    def _worker_loop(self) -> None:
-        # One recognizer per worker thread (Vision request built per call).
-        recognizer = TextRecognizer()
-        detector = RuleDetector(self._rule_config)
-        last_sig = None  # signature of the last frame we actually OCR'd
-        last_payload = None  # (cgimage, pinned_array) of the last sanitized frame
-        while not self._worker_stop.is_set():
-            if not self._frame_ready.wait(0.5):
-                continue
-            self._frame_ready.clear()
-            with self._slot_lock:
-                frame = self._latest_frame
-                self._latest_frame = None
-            if frame is None:
-                continue
-            # Stamp epoch now; a later pause/stop bumps it and drops the publish.
-            epoch = self._presenter.currentEpoch()
-
-            sig = _frame_signature(frame)
-            if last_payload is not None and _unchanged(last_sig, sig):
-                # Unchanged: republish the last SANITIZED frame. Never re-apply
-                # old geometry to the new raw frame, and never publish it raw.
-                cg, pinned = last_payload
-                AppHelper.callAfter(
-                    self._presenter.publishPayload_, (epoch, cg, pinned)
-                )
-                continue
-
-            try:
-                lines = recognizer.recognize(frame)
-                detections = detector.detect([ln.text for ln in lines])
-                masked = redact(frame, lines, detections)
-            except Exception as exc:  # noqa: BLE001 - any failure must go neutral
-                # Any failure (OCR/detect/render) is not "no sensitive text":
-                # publish neutral, never the raw or partially processed frame.
-                print(f"[pipeline] frame failed: {type(exc).__name__}", file=sys.stderr)
-                AppHelper.callAfter(self._presenter.publishNeutralForEpoch_, epoch)
-                last_sig = None  # do not skip after a failure; reprocess next frame
-                last_payload = None
-                continue
-
-            cg, pinned = _cgimage_from_bgra(masked)
-            # callAfter passes the Python tuple to the main thread without ObjC
-            # container coercion, so `pinned` stays alive to back the CGImage.
-            AppHelper.callAfter(self._presenter.publishPayload_, (epoch, cg, pinned))
-            last_sig = sig
-            last_payload = (cg, pinned)
+    def _on_pipeline_error(self, exc_type: str) -> None:
+        print(f"[pipeline] frame failed: {exc_type}", file=sys.stderr)
 
     def request_pause(self) -> None:
         print("[controls] pause")
-        self._presenter.pause()
+        self._state.pause()
+        if self._pipeline is not None:
+            self._pipeline.invalidate()
+        if self._presenter is not None:
+            self._presenter.show_neutral()
 
     def request_resume(self) -> None:
+        if not self._state.go_live():
+            print("[controls] resume ignored: session stopped")
+            return
         print("[controls] resume")
-        self._presenter.goLive()
+        if self._pipeline is not None:
+            self._pipeline.invalidate()
 
     def request_stop(self) -> None:
         print("[controls] stop")
-        self._worker_stop.set()
-        self._presenter.stop()
+        self._state.stop()
+        if self._pipeline is not None:
+            self._pipeline.invalidate()
+            self._pipeline.shutdown()
+        if self._presenter is not None:
+            self._presenter.show_neutral()
         if self._capture is not None:
             self._capture.stop()
 
     def request_quit(self) -> None:
         print("[controls] quit")
-        self._worker_stop.set()
+        self._state.stop()
+        if self._pipeline is not None:
+            self._pipeline.shutdown()
         if self._capture is not None:
             self._capture.stop()
         AppHelper.stopEventLoop()
 
-    def _build_windows(self) -> None:
+    def _build_windows(self) -> LayerPresenter:
         out_style = NSWindowStyleMaskTitled | NSWindowStyleMaskMiniaturizable
         self._output_window = (
             NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -307,7 +242,8 @@ class SafeShareSpike:
         scale = self._output_window.backingScaleFactor() or 1.0
         layer.setContentsScale_(scale)
         self._output_window.setContentView_(view)
-        self._presenter = Presenter.alloc().initWithLayer_(layer)
+        presenter = LayerPresenter(layer, self._state)
+        self._presenter = presenter
 
         # Separate window: buttons must not land in the shared surface.
         ctl_style = (
@@ -344,6 +280,7 @@ class SafeShareSpike:
 
         self._output_window.makeKeyAndOrderFront_(None)
         self._controls_window.orderFront_(None)
+        return presenter
 
     def run(self) -> int:
         self._app = NSApplication.sharedApplication()
@@ -360,7 +297,7 @@ class SafeShareSpike:
             )
             return 1
 
-        self._build_windows()
+        presenter = self._build_windows()
         self._app.activate()
 
         self._rule_config, cfg_source = load_rule_config()
@@ -382,10 +319,18 @@ class SafeShareSpike:
             f"@scale {self._capture.point_scale} | {self._capture.exclusion_note}"
         )
 
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        pipeline = FramePipeline(
+            TextRecognizer(),
+            RuleDetector(self._rule_config),
+            presenter,
+            self._state,
+            on_error=self._on_pipeline_error,
+        )
+        self._pipeline = pipeline
+        self._worker = threading.Thread(target=pipeline.run, daemon=True)
         self._worker.start()
 
-        self._presenter.goLive()
+        self._state.go_live()
         self._capture.start()
 
         # installInterrupt handles SIGINT (Ctrl-C); add SIGTERM so `kill` also

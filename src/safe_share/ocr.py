@@ -8,22 +8,15 @@ and publish neutral output, never as "no sensitive text" (privacy rule 4).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import objc
 import Quartz
 import Vision
 from PIL import Image
 
+from .types import OcrLine
 
-@dataclass(frozen=True)
-class OcrLine:
-    """One recognized text line. `box` is (x0, y0, x1, y1) full-res, top-left."""
-
-    text: str
-    box: tuple[int, int, int, int]
-    confidence: float
+__all__ = ["OcrError", "OcrLine", "TextRecognizer"]
 
 
 class OcrError(Exception):

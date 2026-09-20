@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .detect import Detection
-from .ocr import OcrLine
+from .types import OcrLine
 
 _LABEL = "[PRIVATE]"
 _PAD_FRAC = 0.15

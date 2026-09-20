@@ -1,0 +1,311 @@
+"""Offline tests for the publication invariants. No screen, no Vision."""
+
+from __future__ import annotations
+
+import threading
+
+import numpy as np
+import pytest
+
+from safe_share.detect import RuleConfig, RuleDetector
+from safe_share.ocr import OcrError
+from safe_share.pipeline import FramePipeline, SessionState
+from safe_share.types import OcrLine
+
+_EMAIL_BOX = (4, 4, 60, 20)
+
+
+def _frame(fill: int = 200) -> np.ndarray:
+    frame = np.full((64, 96, 4), fill, dtype=np.uint8)
+    frame[..., 3] = 255
+    return frame
+
+
+class FakeRecognizer:
+    """Returns one line of text regardless of the pixels."""
+
+    def __init__(self, text: str = "mail me at ana@example.invalid") -> None:
+        self._text = text
+        self.calls = 0
+
+    def recognize(self, frame: np.ndarray) -> list[OcrLine]:
+        self.calls += 1
+        return [OcrLine(text=self._text, box=_EMAIL_BOX, confidence=1.0)]
+
+
+class BlockingRecognizer(FakeRecognizer):
+    """Blocks inside recognize() so a state change can race the OCR call."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def recognize(self, frame: np.ndarray) -> list[OcrLine]:
+        self.entered.set()
+        assert self.release.wait(5), "test did not release the recognizer"
+        return super().recognize(frame)
+
+
+class FailingRecognizer:
+    def recognize(self, frame: np.ndarray) -> list[OcrLine]:
+        raise OcrError("Vision performRequests failed")
+
+
+class RecordingPublisher:
+    def __init__(self) -> None:
+        self.frames: list[tuple[int, int, np.ndarray]] = []
+        self.neutrals: list[int] = []
+
+    def publish(self, epoch: int, seq: int, frame: np.ndarray) -> None:
+        self.frames.append((epoch, seq, frame))
+
+    def publish_neutral(self, epoch: int) -> None:
+        self.neutrals.append(epoch)
+
+
+def _pipeline(recognizer, terms: list[str] | None = None):
+    state = SessionState()
+    publisher = RecordingPublisher()
+    pipeline = FramePipeline(
+        recognizer,
+        RuleDetector(RuleConfig(terms=terms or [])),
+        publisher,
+        state,
+    )
+    return pipeline, publisher, state
+
+
+def _run_in_thread(pipeline: FramePipeline) -> threading.Thread:
+    worker = threading.Thread(target=pipeline.run, daemon=True)
+    worker.start()
+    return worker
+
+
+def test_pause_during_ocr_publishes_nothing():
+    recognizer = BlockingRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+    worker = _run_in_thread(pipeline)
+
+    pipeline.submit(_frame())
+    assert recognizer.entered.wait(5)
+    state.pause()
+    pipeline.invalidate()
+    recognizer.release.set()
+
+    pipeline.shutdown()
+    worker.join(5)
+    assert publisher.frames == []
+    assert pipeline.dropped_epoch == 1
+
+
+def test_frame_captured_while_paused_is_never_published_after_resume():
+    """The reported leak: the worker dequeues a paused-period frame, and the
+    resume lands before it is processed."""
+    recognizer = FakeRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+    state.pause()
+
+    pipeline.submit(_frame())  # captured while the output was neutral
+    taken = pipeline._take()  # worker dequeues it before the resume
+    state.go_live()
+    pipeline.invalidate()  # cannot reach a frame already dequeued
+    pipeline.process(*taken)
+
+    assert recognizer.calls == 0
+    assert publisher.frames == []
+
+
+def test_pause_and_resume_between_capture_and_processing_drops_the_frame():
+    """A full pause/resume cycle while a frame waits must discard it, even
+    though the session is live again by the time it is processed."""
+    recognizer = FakeRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+
+    pipeline.submit(_frame())
+    taken = pipeline._take()
+    assert taken is not None
+    state.pause()
+    state.go_live()
+
+    pipeline.process(*taken)
+
+    assert recognizer.calls == 0
+    assert publisher.frames == []
+
+
+def test_resume_bumps_the_epoch():
+    """Without the bump, a frame stamped during the pause becomes publishable
+    again on resume."""
+    state = SessionState()
+    state.go_live()
+    paused_epoch = (state.pause(), state.epoch)[1]
+    state.go_live()
+
+    assert state.accepts(paused_epoch) is False
+
+
+def test_frames_submitted_while_paused_are_not_ocrd():
+    recognizer = FakeRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+    epoch = state.epoch
+    state.pause()
+
+    pipeline.process(_frame(), 1, epoch)
+
+    assert recognizer.calls == 0
+    assert publisher.frames == []
+    assert pipeline.dropped_not_live == 1
+
+
+def test_ocr_failure_publishes_neutral_and_reruns_ocr_next_frame():
+    recognizer = FailingRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+
+    pipeline.process(_frame(), 1, state.epoch)
+
+    assert publisher.frames == []
+    assert publisher.neutrals == [state.epoch]
+    assert pipeline.failed == 1
+
+    # The skip cache must not survive a failure: the next identical frame is
+    # processed again rather than republished.
+    pipeline._recognizer = FakeRecognizer()
+    pipeline.process(_frame(), 2, state.epoch)
+    assert pipeline.republished == 0
+    assert pipeline.published == 1
+
+
+def test_failure_while_paused_publishes_no_neutral_for_a_stale_epoch():
+    pipeline, publisher, state = _pipeline(FailingRecognizer())
+    state.go_live()
+    epoch = state.epoch
+    state.pause()
+    state.go_live()
+
+    pipeline.process(_frame(), 1, epoch)
+
+    assert publisher.neutrals == []
+    assert publisher.frames == []
+
+
+def test_worker_death_stops_the_session_and_publishes_neutral():
+    """A failure outside the per-frame try (here, in the publisher) must not
+    leave the last sanitized frame on screen."""
+
+    class ExplodingPublisher(RecordingPublisher):
+        def publish(self, epoch: int, seq: int, frame: np.ndarray) -> None:
+            raise RuntimeError("publish failed")
+
+    state = SessionState()
+    publisher = ExplodingPublisher()
+    pipeline = FramePipeline(
+        FakeRecognizer(), RuleDetector(RuleConfig()), publisher, state
+    )
+    state.go_live()
+    pipeline.submit(_frame())
+    worker = _run_in_thread(pipeline)
+    worker.join(5)
+
+    assert worker.is_alive() is False
+    assert state.stopped is True
+    assert publisher.frames == []
+    assert publisher.neutrals != []
+
+
+def test_worker_death_survives_a_publisher_that_also_fails_on_neutral():
+    class DeadPublisher(RecordingPublisher):
+        def publish(self, epoch: int, seq: int, frame: np.ndarray) -> None:
+            raise RuntimeError("publish failed")
+
+        def publish_neutral(self, epoch: int) -> None:
+            raise RuntimeError("runloop gone")
+
+    state = SessionState()
+    pipeline = FramePipeline(
+        FakeRecognizer(), RuleDetector(RuleConfig()), DeadPublisher(), state
+    )
+    state.go_live()
+    pipeline.submit(_frame())
+
+    escaped: list[BaseException] = []
+    previous = threading.excepthook
+    threading.excepthook = lambda args: escaped.append(args.exc_value)
+    try:
+        worker = _run_in_thread(pipeline)
+        worker.join(5)
+    finally:
+        threading.excepthook = previous
+
+    # An escaping exception would be printed with its message, which can carry
+    # recognized text.
+    assert escaped == []
+    assert state.stopped is True
+
+
+def test_published_frame_is_masked():
+    pipeline, publisher, state = _pipeline(FakeRecognizer())
+    state.go_live()
+
+    pipeline.process(_frame(), 1, state.epoch)
+
+    assert len(publisher.frames) == 1
+    _, _, out = publisher.frames[0]
+    x0, y0, x1, y1 = _EMAIL_BOX
+    assert (out[y0:y1, x0:x1, 0:3] == 0).all()
+
+
+def test_unchanged_frame_republishes_the_sanitized_frame():
+    recognizer = FakeRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+
+    pipeline.process(_frame(), 1, state.epoch)
+    second = _frame()
+    pipeline.process(second, 2, state.epoch)
+
+    assert recognizer.calls == 1
+    assert pipeline.republished == 1
+    assert publisher.frames[1][2] is not second
+
+
+def test_stop_is_terminal():
+    pipeline, publisher, state = _pipeline(FakeRecognizer())
+    state.go_live()
+    epoch = state.epoch
+    state.stop()
+
+    assert state.go_live() is False
+    pipeline.process(_frame(), 1, epoch)
+    assert publisher.frames == []
+
+
+def test_older_slot_frames_are_dropped():
+    pipeline, _, state = _pipeline(FakeRecognizer())
+    state.go_live()
+
+    pipeline.submit(_frame())
+    second_seq = pipeline.submit(_frame())
+
+    assert pipeline.dropped_stale == 1
+    assert pipeline.pending_seq == second_seq
+
+
+@pytest.mark.parametrize(
+    ("accepted", "seq", "last_seq", "expected"),
+    [
+        (True, 2, 1, True),
+        (False, 2, 1, False),  # paused, stopped or stale epoch
+        (True, 1, 1, False),  # already on screen
+        (True, 1, 2, False),  # out of order
+    ],
+)
+def test_should_deliver(accepted, seq, last_seq, expected):
+    from safe_share.spike import should_deliver
+
+    assert should_deliver(accepted, seq, last_seq) is expected

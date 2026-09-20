@@ -114,7 +114,8 @@ def _frame_from_sample_buffer(sbuf) -> Frame | None:
             return None
         buf = base.as_buffer(bpr * h)
         # bpr is padded (> w*4); reshape by bpr//4 then slice. .copy() is
-        # required: the bytes are valid only until unlock.
+        # required: the bytes are valid only until unlock, and the published
+        # CGImage reads this array without copying it.
         arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, bpr // 4, 4)
         return arr[:, :w, :].copy()
     finally:
@@ -123,7 +124,8 @@ def _frame_from_sample_buffer(sbuf) -> Frame | None:
 
 class _StreamOutput(
     NSObject,
-    protocols=[
+    # PyObjC consumes this class keyword; it is not an __init_subclass__ arg.
+    protocols=[  # pyright: ignore[call-arg]
         objc.protocolNamed("SCStreamOutput"),
         objc.protocolNamed("SCStreamDelegate"),
     ],
