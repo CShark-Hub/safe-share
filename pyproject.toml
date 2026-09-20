@@ -8,7 +8,9 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "numpy>=2.5.3",
     "pyobjc-framework-cocoa>=12.2.2",
+    "pyobjc-framework-libdispatch>=12.2.2",
     "pyobjc-framework-quartz>=12.2.2",
     "pyobjc-framework-screencapturekit>=12.2.2",
     "pyobjc-framework-vision>=12.2.2",
@@ -20,3 +22,24 @@ safe-share = "safe_share:main"
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.8",
+]
+
+[tool.ruff.lint]
+# PLW0642: PyObjC init methods reassign `self` from objc.super().init(); required.
+ignore = ["PLW0642"]
+
+[tool.pyright]
+# PyObjC builds framework attributes dynamically at import (from BridgeSupport),
+# so Pylance/Pyright cannot see NSObject, SCContentFilter, kCV* etc. though they
+# exist at runtime. Silence the resulting false positives.
+reportAttributeAccessIssue = false
+reportMissingModuleSource = false
+# NSObject subclasses use the `protocols=` class keyword and ObjC selector calls
+# Pyright cannot validate.
+reportCallIssue = false
+# Attributes initialised to None in __init__ and assigned before use.
+reportOptionalMemberAccess = false

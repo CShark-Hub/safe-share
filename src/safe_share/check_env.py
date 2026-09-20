@@ -26,15 +26,21 @@ FIXTURE_TEXT = "Safe Share OCR check 12345"
 
 def _run(*cmd: str) -> str:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, check=False
+        ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 
 def report_versions() -> None:
     print("== environment ==")
-    print(f"  macOS          : {platform.mac_ver()[0]} (build {_run('sw_vers', '-buildVersion')})")
-    print(f"  hardware       : {_run('sysctl', '-n', 'hw.model')} / {_run('sysctl', '-n', 'machdep.cpu.brand_string')}")
+    print(
+        f"  macOS          : {platform.mac_ver()[0]} (build {_run('sw_vers', '-buildVersion')})"
+    )
+    print(
+        f"  hardware       : {_run('sysctl', '-n', 'hw.model')} / {_run('sysctl', '-n', 'machdep.cpu.brand_string')}"
+    )
     print(f"  python         : {platform.python_version()} ({sys.executable})")
 
     import sysconfig
@@ -70,7 +76,12 @@ def check_screencapturekit_symbols() -> bool:
     import ScreenCaptureKit
 
     ok = True
-    for name in ("SCShareableContent", "SCContentFilter", "SCStream", "SCStreamConfiguration"):
+    for name in (
+        "SCShareableContent",
+        "SCContentFilter",
+        "SCStream",
+        "SCStreamConfiguration",
+    ):
         present = hasattr(ScreenCaptureKit, name)
         print(f"  {name:<24} {OK if present else FAIL}")
         ok = ok and present
@@ -86,7 +97,9 @@ def check_permission() -> bool:
     print(f"  granted        : {granted}")
     if not granted:
         print("  (run with --request to ask for it, or grant it in")
-        print("   System Settings > Privacy & Security > Screen & System Audio Recording)")
+        print(
+            "   System Settings > Privacy & Security > Screen & System Audio Recording)"
+        )
     return granted
 
 
@@ -94,7 +107,9 @@ def request_permission() -> None:
     print("\n== requesting screen recording permission ==")
     import Quartz
 
-    print(f"  CGRequestScreenCaptureAccess -> {bool(Quartz.CGRequestScreenCaptureAccess())}")
+    print(
+        f"  CGRequestScreenCaptureAccess -> {bool(Quartz.CGRequestScreenCaptureAccess())}"
+    )
     print("  macOS may require restarting this process for a new grant to take effect.")
 
 
@@ -161,7 +176,9 @@ def check_vision() -> bool:
         return False
     print(f"  fixture        : {OK} drawn in memory ({len(image_data)} bytes)")
 
-    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(image_data, None)
+    handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(
+        image_data, None
+    )
     request = Vision.VNRecognizeTextRequest.alloc().init()
     request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
 
