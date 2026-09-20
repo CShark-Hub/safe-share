@@ -7,6 +7,7 @@ captured. Masking, scheduling and the neutral screen live in `spike.py`.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,11 +20,14 @@ import Quartz
 import ScreenCaptureKit as SCK
 from Foundation import NSObject
 
+from .capture_errors import StopDisposition, classify_stop
+
 # BGRA, shape (h, w, 4); a private copy that outlives its CVPixelBuffer.
 Frame = np.ndarray
 
 FrameHandler = Callable[[Frame], None]  # called per Complete frame, capture queue
-StopHandler = Callable[[str], None]  # called on unexpected stop, SCK queue
+# Called when the stream stops, on an SCK queue: (disposition, human-readable).
+StopHandler = Callable[[StopDisposition, str], None]
 
 
 @dataclass
@@ -143,15 +147,38 @@ class _StreamOutput(
     def stream_didOutputSampleBuffer_ofType_(self, stream, sbuf, otype):
         if otype != SCK.SCStreamOutputTypeScreen:
             return
-        # Off-main callback: drain temporaries here or memory climbs.
-        with objc.autorelease_pool():
-            frame = _frame_from_sample_buffer(sbuf)
-            if frame is not None:
-                self._frame_handler(frame)
+        # PyObjC swallows exceptions raised in a callback, so a broken frame path
+        # would silently kill the pipeline. Route any failure to a neutral stop.
+        try:
+            # Off-main callback: drain temporaries here or memory climbs.
+            with objc.autorelease_pool():
+                frame = _frame_from_sample_buffer(sbuf)
+                if frame is not None:
+                    self._frame_handler(frame)
+        except Exception as exc:  # noqa: BLE001
+            self._stop_handler(
+                StopDisposition.TERMINAL, f"frame handler error: {type(exc).__name__}"
+            )
 
     def stream_didStopWithError_(self, stream, error):
-        code = error.code() if error is not None else 0
-        self._stop_handler(f"stream stopped (code {code})")
+        with objc.autorelease_pool():  # foreign queue; drain the NSError
+            if error is None:
+                self._stop_handler(StopDisposition.CLEAN, "stream stopped")
+                return
+            code = error.code()
+            disposition = classify_stop(code)
+            # Log domain+code only, never localizedDescription: keep any possible
+            # app/window name out of the log (rule 6).
+            self._stop_handler(disposition, f"{error.domain()} code {code}")
+
+    # Active/inactive fire on the SCK queue (macOS 15.2+). Observational for now:
+    # inactive behaviour on a display filter is unverified on this machine, so we
+    # log rather than assume it is terminal. The watchdog covers a real stall.
+    def streamDidBecomeInactive_(self, stream):
+        print("[capture] stream inactive", file=sys.stderr)
+
+    def streamDidBecomeActive_(self, stream):
+        print("[capture] stream active", file=sys.stderr)
 
 
 class DisplayCapture:
@@ -231,10 +258,22 @@ class DisplayCapture:
 
         def on_started(error):
             if error is not None:
-                self._stop_handler(f"failed to start capture: {error}")
+                disposition = classify_stop(error.code())
+                self._stop_handler(
+                    disposition, f"failed to start capture: {error.code()}"
+                )
 
         self._stream.startCaptureWithCompletionHandler_(on_started)
 
     def stop(self) -> None:
-        if self._stream is not None:
-            self._stream.stopCaptureWithCompletionHandler_(lambda error: None)
+        # Idempotent: a double Stop (or Stop after an error stop) must not raise
+        # -3808 or re-stop a cleared stream.
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+
+        def on_stopped(error):
+            if error is not None:
+                print(f"[capture] stop error: {error.code()}", file=sys.stderr)
+
+        stream.stopCaptureWithCompletionHandler_(on_stopped)

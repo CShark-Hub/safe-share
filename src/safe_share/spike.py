@@ -23,7 +23,10 @@ from AppKit import (
     NSButton,
     NSMakeRect,
     NSStackView,
+    NSTextField,
+    NSTimer,
     NSUserInterfaceLayoutOrientationHorizontal,
+    NSUserInterfaceLayoutOrientationVertical,
     NSView,
     NSWindow,
     NSWindowStyleMaskClosable,
@@ -35,7 +38,9 @@ from PyObjCTools import AppHelper
 from Quartz import CATransaction
 
 from .capture import CaptureError, DisplayCapture
+from .capture_errors import StopDisposition
 from .config import load_rule_config
+from .control_state import button_enablement, control_state, status_text
 from .detect import RuleConfig, RuleDetector
 from .ocr import TextRecognizer
 from .pipeline import FramePipeline, SessionState
@@ -157,6 +162,9 @@ class Controls(NSObject):
     def quitClicked_(self, sender):
         self._app.request_quit()
 
+    def refreshTick_(self, timer):
+        self._app._refresh_controls()
+
 
 class SafeShareSpike:
     """Wires capture, pipeline, presenter and controls into one running app."""
@@ -167,6 +175,9 @@ class SafeShareSpike:
         self._controls_target = None
         self._output_window = None
         self._controls_window = None
+        self._buttons: dict[str, object] = {}
+        self._status_label = None
+        self._refresh_timer = None
         self._capture: DisplayCapture | None = None
         self._rule_config = RuleConfig()
         self._state = SessionState()
@@ -177,16 +188,36 @@ class SafeShareSpike:
         if self._pipeline is not None:
             self._pipeline.submit(frame)
 
-    def _on_stop(self, message: str) -> None:
-        print(f"[capture] {message}", file=sys.stderr)
+    def _on_stop(self, disposition: StopDisposition, message: str) -> None:
+        # Every disposition ends the session with neutral output; the class only
+        # informs the log (a future rebuild path can branch on RECOVERABLE).
+        print(f"[capture] stop ({disposition.value}): {message}", file=sys.stderr)
         self._state.stop()  # before shutdown: no in-flight frame may publish
         if self._pipeline is not None:
             self._pipeline.shutdown()
         if self._presenter is not None:
             AppHelper.callAfter(self._presenter.show_neutral)
+        # A frame-handler error stops via here while the stream is still live;
+        # tear it down on the main thread (idempotent if already stopped).
+        AppHelper.callAfter(self._teardown_capture)
 
-    def _on_pipeline_error(self, exc_type: str) -> None:
-        print(f"[pipeline] frame failed: {exc_type}", file=sys.stderr)
+    def _on_pipeline_error(self, reason: str) -> None:
+        if reason == "watchdog":
+            print(
+                "[pipeline] watchdog fired: output stalled → neutral", file=sys.stderr
+            )
+        else:
+            print(f"[pipeline] frame failed: {reason}", file=sys.stderr)
+
+    def _on_session_stopped(self) -> None:
+        # Pipeline ended the session (watchdog/worker death) on a background
+        # thread; tear down capture on the main thread. stop() is idempotent.
+        AppHelper.callAfter(self._teardown_capture)
+
+    def _teardown_capture(self) -> None:
+        if self._capture is not None:
+            self._capture.stop()
+        self._refresh_controls()
 
     def request_pause(self) -> None:
         print("[controls] pause")
@@ -195,14 +226,17 @@ class SafeShareSpike:
             self._pipeline.invalidate()
         if self._presenter is not None:
             self._presenter.show_neutral()
+        self._refresh_controls()
 
     def request_resume(self) -> None:
         if not self._state.go_live():
             print("[controls] resume ignored: session stopped")
+            self._refresh_controls()
             return
         print("[controls] resume")
         if self._pipeline is not None:
             self._pipeline.invalidate()
+        self._refresh_controls()
 
     def request_stop(self) -> None:
         print("[controls] stop")
@@ -214,6 +248,7 @@ class SafeShareSpike:
             self._presenter.show_neutral()
         if self._capture is not None:
             self._capture.stop()
+        self._refresh_controls()
 
     def request_quit(self) -> None:
         print("[controls] quit")
@@ -253,34 +288,61 @@ class SafeShareSpike:
         )
         self._controls_window = (
             NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(120, 40, 420, 70), ctl_style, NSBackingStoreBuffered, False
+                NSMakeRect(120, 40, 420, 104), ctl_style, NSBackingStoreBuffered, False
             )
         )
         self._controls_window.setTitle_("Safe Share Controls")
         self._controls_window.setReleasedWhenClosed_(False)
 
         self._controls_target = Controls.alloc().initWithApp_(self)
-        pause = NSButton.buttonWithTitle_target_action_(
-            "Pause", self._controls_target, b"pauseClicked:"
-        )
-        resume = NSButton.buttonWithTitle_target_action_(
-            "Resume", self._controls_target, b"resumeClicked:"
-        )
-        stop = NSButton.buttonWithTitle_target_action_(
-            "Stop", self._controls_target, b"stopClicked:"
-        )
+        self._buttons = {
+            "pause": NSButton.buttonWithTitle_target_action_(
+                "Pause", self._controls_target, b"pauseClicked:"
+            ),
+            "resume": NSButton.buttonWithTitle_target_action_(
+                "Resume", self._controls_target, b"resumeClicked:"
+            ),
+            "stop": NSButton.buttonWithTitle_target_action_(
+                "Stop", self._controls_target, b"stopClicked:"
+            ),
+        }
         quit_ = NSButton.buttonWithTitle_target_action_(
             "Quit", self._controls_target, b"quitClicked:"
         )
-        stack = NSStackView.stackViewWithViews_([pause, resume, stop, quit_])
-        stack.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
-        stack.setSpacing_(8)
-        stack.setFrame_(self._controls_window.contentView().bounds())
-        self._controls_window.contentView().addSubview_(stack)
+        button_row = NSStackView.stackViewWithViews_(
+            [
+                self._buttons["pause"],
+                self._buttons["resume"],
+                self._buttons["stop"],
+                quit_,
+            ]
+        )
+        button_row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
+        button_row.setSpacing_(8)
+
+        self._status_label = NSTextField.labelWithString_("")
+        column = NSStackView.stackViewWithViews_([self._status_label, button_row])
+        column.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
+        column.setSpacing_(8)
+        column.setFrame_(self._controls_window.contentView().bounds())
+        self._controls_window.contentView().addSubview_(column)
 
         self._output_window.makeKeyAndOrderFront_(None)
         self._controls_window.orderFront_(None)
+        self._refresh_controls()
         return presenter
+
+    def _refresh_controls(self) -> None:
+        """Reflect the session state in the buttons and status label. Main thread
+        only; a repeating timer also runs it so a background stop (watchdog,
+        capture error) updates the UI without a per-path hop."""
+        live, stopped = self._state.snapshot()
+        state = control_state(live, stopped)
+        enabled = button_enablement(state)
+        for name, button in self._buttons.items():
+            button.setEnabled_(enabled[name])
+        if self._status_label is not None:
+            self._status_label.setStringValue_(status_text(state))
 
     def run(self) -> int:
         self._app = NSApplication.sharedApplication()
@@ -325,6 +387,7 @@ class SafeShareSpike:
             presenter,
             self._state,
             on_error=self._on_pipeline_error,
+            on_session_stopped=self._on_session_stopped,
         )
         self._pipeline = pipeline
         self._worker = threading.Thread(target=pipeline.run, daemon=True)
@@ -332,6 +395,14 @@ class SafeShareSpike:
 
         self._state.go_live()
         self._capture.start()
+        self._refresh_controls()
+
+        # Reflect a background stop (watchdog, capture error) in the controls.
+        self._refresh_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.3, self._controls_target, b"refreshTick:", None, True
+            )
+        )
 
         # installInterrupt handles SIGINT (Ctrl-C); add SIGTERM so `kill` also
         # stops the stream before exit rather than dropping to default terminate.

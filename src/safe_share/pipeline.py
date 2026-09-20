@@ -104,6 +104,11 @@ class SessionState:
         with self._lock:
             return self._live and not self._stopped and epoch == self._epoch
 
+    def snapshot(self) -> tuple[bool, bool]:
+        """(live, stopped) read atomically, so a UI refresh sees one state."""
+        with self._lock:
+            return (self._live and not self._stopped, self._stopped)
+
 
 def frame_signature(frame: np.ndarray) -> np.ndarray:
     """Box-pooled luma thumbnail for change detection.
@@ -144,6 +149,7 @@ class FramePipeline:
         publisher: Publisher,
         state: SessionState,
         on_error: Callable[[str], None] | None = None,
+        on_session_stopped: Callable[[], None] | None = None,
         watchdog_timeout: float = _WATCHDOG_TIMEOUT,
         watchdog_poll: float = _WATCHDOG_POLL,
         watchdog_first_frame: float = _WATCHDOG_FIRST_FRAME,
@@ -154,6 +160,10 @@ class FramePipeline:
         self._publisher = publisher
         self._state = state
         self._on_error = on_error
+        # Called once when the pipeline itself ends the session (watchdog or
+        # worker death), so the owner can tear down capture. Not called on a
+        # per-frame failure, which keeps running.
+        self._on_session_stopped = on_session_stopped
         self._watchdog_timeout = watchdog_timeout
         self._watchdog_poll = watchdog_poll
         self._watchdog_first_frame = watchdog_first_frame
@@ -269,6 +279,8 @@ class FramePipeline:
             if self._on_error is not None:
                 self._on_error("watchdog")
             self._publisher.publish_neutral(self._state.epoch)
+            if self._on_session_stopped is not None:
+                self._on_session_stopped()
         except Exception:  # noqa: BLE001, S110
             pass
 
@@ -304,6 +316,8 @@ class FramePipeline:
                 if self._on_error is not None:
                     self._on_error(type(exc).__name__)
                 self._publisher.publish_neutral(self._state.epoch)
+                if self._on_session_stopped is not None:
+                    self._on_session_stopped()
             except Exception:  # noqa: BLE001, S110
                 pass
         finally:

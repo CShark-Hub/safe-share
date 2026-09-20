@@ -220,8 +220,13 @@ def test_worker_death_stops_the_session_and_publishes_neutral():
 
     state = SessionState()
     publisher = ExplodingPublisher()
+    stopped_calls = []
     pipeline = FramePipeline(
-        FakeRecognizer(), RuleDetector(RuleConfig()), publisher, state
+        FakeRecognizer(),
+        RuleDetector(RuleConfig()),
+        publisher,
+        state,
+        on_session_stopped=lambda: stopped_calls.append(True),
     )
     state.go_live()
     pipeline.submit(_frame())
@@ -232,6 +237,7 @@ def test_worker_death_stops_the_session_and_publishes_neutral():
     assert state.stopped is True
     assert publisher.frames == []
     assert publisher.neutrals != []
+    assert stopped_calls == [True]  # worker death tears down capture too
 
 
 def test_worker_death_survives_a_publisher_that_also_fails_on_neutral():
@@ -327,6 +333,36 @@ def test_watchdog_gives_the_first_frame_a_wider_budget():
     clock.t = 11.0  # now past the first-frame grace
     assert pipeline._watchdog_tick(True) is False
     assert publisher.neutrals != []
+
+
+def test_watchdog_fire_notifies_session_stopped():
+    clock = FakeClock()
+    stopped_calls = []
+    pipeline, _, state = _pipeline(
+        BlockingRecognizer(),
+        watchdog_timeout=2.0,
+        watchdog_first_frame=2.0,
+        monotonic=clock,
+        on_session_stopped=lambda: stopped_calls.append(True),
+    )
+    state.go_live()
+    pipeline._watchdog_tick(False)
+    clock.t = 3.0
+    pipeline._watchdog_tick(True)
+
+    assert stopped_calls == [True]
+
+
+def test_per_frame_failure_does_not_notify_session_stopped():
+    stopped_calls = []
+    pipeline, _, state = _pipeline(
+        FailingRecognizer(),
+        on_session_stopped=lambda: stopped_calls.append(True),
+    )
+    state.go_live()
+    pipeline.process(_frame(), 1, state.epoch)
+
+    assert stopped_calls == []  # a failed frame goes neutral but keeps running
 
 
 def test_watchdog_narrows_to_steady_timeout_after_first_publish():
