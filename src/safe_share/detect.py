@@ -42,7 +42,9 @@ class Detection:
 class RuleConfig:
     emails: bool = True
     credentials: bool = True
-    terms: list[str] = field(default_factory=list)
+    # repr=False: the terms are the user's private words and must stay out of
+    # logs, reprs and tracebacks.
+    terms: list[str] = field(default_factory=list, repr=False)
 
 
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
