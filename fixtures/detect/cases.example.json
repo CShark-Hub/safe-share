@@ -1,0 +1,57 @@
+{
+  "_comment": "TEMPLATE for the eval fixture set. Copy this file to cases.json (gitignored) and replace every <...> placeholder with your own SYNTHETIC, non-functional value that matches the named detector shape. Then run: python -m safe_share.eval_detect. Never commit real or contiguous credential-shaped values; that is why the real cases.json is gitignored and this template uses placeholders. Emails use RFC 2606 example domains and names are fictional.",
+  "shapes": {
+    "aws_key": "AKIA or ASIA + 16 uppercase letters/digits",
+    "github_token": "ghp_ (or gho_/ghu_/ghs_/ghr_) + 36 alphanumerics",
+    "slack_token": "xoxb- (or xoxa/xoxp/...) + 10+ chars",
+    "google_key": "AIza + 35 url-safe chars",
+    "stripe_key": "sk_live_ / pk_live_ / rk_live_ + 16+ alphanumerics",
+    "jwt": "eyJ... . base64url . base64url",
+    "keyed_secret": "keyword (password/secret/token/api key) then : or = then value",
+    "pem_key": "BEGIN ... PRIVATE KEY block through END, one entry per line",
+    "email": "local@domain.tld",
+    "term": "an exact name/term listed in `terms`"
+  },
+  "terms": ["Maya Chen", "Project Halibut", "Northwind"],
+  "cases": [
+    {"id": "email_plain", "lines": ["contact alice@example.com for access"],
+     "expect": [{"line": 0, "text": "alice@example.com", "type": "email"}]},
+
+    {"id": "term_multiword", "lines": ["reviewed by Maya Chen today"],
+     "expect": [{"line": 0, "text": "Maya Chen", "type": "term"}]},
+    {"id": "term_not_substring", "lines": ["the northwinds blew hard"], "expect": []},
+
+    {"id": "aws_akia", "lines": ["AWS_ACCESS_KEY_ID=<aws-key>"],
+     "expect": [{"line": 0, "text": "<aws-key>", "type": "aws_key"}]},
+    {"id": "github_pat", "lines": ["token <github-token> set"],
+     "expect": [{"line": 0, "text": "<github-token>", "type": "github_token"}]},
+    {"id": "slack_bot", "lines": ["<slack-token>"],
+     "expect": [{"line": 0, "text": "<slack-token>", "type": "slack_token"}]},
+    {"id": "google_key", "lines": ["<google-key>"],
+     "expect": [{"line": 0, "text": "<google-key>", "type": "google_key"}]},
+    {"id": "stripe_restricted", "lines": ["<stripe-live-or-restricted-key>"],
+     "expect": [{"line": 0, "text": "<stripe-live-or-restricted-key>", "type": "stripe_key"}]},
+    {"id": "jwt", "lines": ["Bearer <jwt>"],
+     "expect": [{"line": 0, "text": "<jwt>", "type": "jwt"}]},
+
+    {"id": "keyed_inline", "lines": ["password: <secret-value>"],
+     "expect": [{"line": 0, "text": "<secret-value>", "type": "keyed_secret"}]},
+    {"id": "keyed_next_line", "lines": ["password:", "   <secret-value>"],
+     "expect": [{"line": 1, "text": "<secret-value>", "type": "keyed_secret"}]},
+    {"id": "keyed_placeholder_true", "lines": ["token: true"], "expect": []},
+
+    {"id": "pem_block", "lines": [
+        "<pem-begin-marker-line>",
+        "<pem-base64-body-line>",
+        "<pem-end-marker-line>"],
+     "expect": [
+        {"line": 0, "whole_line": true, "type": "pem_key"},
+        {"line": 1, "whole_line": true, "type": "pem_key"},
+        {"line": 2, "whole_line": true, "type": "pem_key"}]},
+
+    {"id": "neg_git_sha", "lines": ["commit a1b2c3d4e5f6789012345678901234567890abcd"], "expect": []},
+    {"id": "neg_uuid", "lines": ["id 550e8400-e29b-41d4-a716-446655440000"], "expect": []},
+    {"id": "neg_hex_color", "lines": ["background #AABBCC solid"], "expect": []},
+    {"id": "neg_plain_sentence", "lines": ["the meeting is at three in the afternoon"], "expect": []}
+  ]
+}

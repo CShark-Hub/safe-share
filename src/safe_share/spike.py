@@ -10,6 +10,7 @@ Run:  python -m safe_share.spike   (needs Screen Recording permission)
 
 from __future__ import annotations
 
+import signal
 import sys
 import threading
 
@@ -35,21 +36,12 @@ from PyObjCTools import AppHelper
 from Quartz import CATransaction
 
 from .capture import CaptureError, DisplayCapture
+from .config import load_rule_config
+from .detect import RuleConfig, RuleDetector
+from .ocr import TextRecognizer
+from .redact import redact
 
 _NEUTRAL_RGBA = (0.10, 0.10, 0.10, 1.0)
-
-
-def apply_demo_mask(frame: np.ndarray) -> np.ndarray:
-    """Paint one opaque black rectangle over a fixed fraction of the frame.
-
-    Mutates and returns `frame`.
-    """
-    h, w = frame.shape[:2]
-    y0, y1 = int(h * 0.10), int(h * 0.22)
-    x0, x1 = int(w * 0.08), int(w * 0.55)
-    frame[y0:y1, x0:x1, 0:3] = 0
-    frame[y0:y1, x0:x1, 3] = 255
-    return frame
 
 
 def _cgimage_from_bgra(arr: np.ndarray):
@@ -138,6 +130,14 @@ class Presenter(NSObject):
         CATransaction.commit()
         self._pinned = pinned
 
+    def publishNeutralForEpoch_(self, epoch):
+        """Neutral for a failed frame; ignored if stale or paused/stopped."""
+        with self._state_lock:
+            drop = self._stopped or not self._live or epoch != self._epoch
+        if drop:
+            return
+        self._show_neutral()
+
     def _show_neutral(self):
         r, g, b, a = _NEUTRAL_RGBA
         CATransaction.begin()
@@ -179,6 +179,7 @@ class SafeShareSpike:
         self._output_window = None
         self._controls_window = None
         self._capture = None
+        self._rule_config = RuleConfig()
 
         # Latest-frame slot: newest raw frame wins, older pending ones drop.
         self._slot_lock = threading.Lock()
@@ -198,6 +199,9 @@ class SafeShareSpike:
         AppHelper.callAfter(self._presenter.stop)
 
     def _worker_loop(self) -> None:
+        # One recognizer per worker thread (Vision request built per call).
+        recognizer = TextRecognizer()
+        detector = RuleDetector(self._rule_config)
         while not self._worker_stop.is_set():
             if not self._frame_ready.wait(0.5):
                 continue
@@ -209,7 +213,16 @@ class SafeShareSpike:
                 continue
             # Stamp epoch now; a later pause/stop bumps it and drops the publish.
             epoch = self._presenter.currentEpoch()
-            masked = apply_demo_mask(frame)
+            try:
+                lines = recognizer.recognize(frame)
+                detections = detector.detect([ln.text for ln in lines])
+                masked = redact(frame, lines, detections)
+            except Exception as exc:  # noqa: BLE001 - any failure must go neutral
+                # Any failure (OCR/detect/render) is not "no sensitive text":
+                # publish neutral, never the raw or partially processed frame.
+                print(f"[pipeline] frame failed: {type(exc).__name__}", file=sys.stderr)
+                AppHelper.callAfter(self._presenter.publishNeutralForEpoch_, epoch)
+                continue
             cg, pinned = _cgimage_from_bgra(masked)
             # callAfter passes the Python tuple to the main thread without ObjC
             # container coercion, so `pinned` stays alive to back the CGImage.
@@ -311,6 +324,13 @@ class SafeShareSpike:
         self._build_windows()
         self._app.activate()
 
+        self._rule_config, cfg_source = load_rule_config()
+        print(
+            f"[config] source={cfg_source} emails={self._rule_config.emails} "
+            f"credentials={self._rule_config.credentials} "
+            f"terms={len(self._rule_config.terms)}"
+        )
+
         self._capture = DisplayCapture(self._on_frame, self._on_stop)
         try:
             self._capture.build()
@@ -329,7 +349,10 @@ class SafeShareSpike:
         self._presenter.goLive()
         self._capture.start()
 
-        # runEventLoop (not app.run) installs a SIGINT handler so Ctrl-C quits.
+        # installInterrupt handles SIGINT (Ctrl-C); add SIGTERM so `kill` also
+        # stops the stream before exit rather than dropping to default terminate.
+        signal.signal(signal.SIGTERM, lambda *_: self.request_quit())
+
         AppHelper.runEventLoop(installInterrupt=True)
         return 0
 

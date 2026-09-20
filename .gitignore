@@ -39,3 +39,9 @@ captures/
 # Local env / secrets
 .env
 .env.*
+
+# Config and fixtures may hold real terms or contiguous synthetic secrets;
+# commit only the *.example templates, keep the working copies local.
+safe_share.toml
+fixtures/detect/cases.json
+fixtures/manual/test_page.html
