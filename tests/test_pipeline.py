@@ -9,7 +9,13 @@ import pytest
 
 from safe_share.detect import RuleConfig, RuleDetector
 from safe_share.ocr import OcrError
-from safe_share.pipeline import FramePipeline, SessionState
+from safe_share.pipeline import (
+    _MAX_SKIP_FRAMES,
+    FramePipeline,
+    SessionState,
+    frame_signature,
+    unchanged,
+)
 from safe_share.types import OcrLine
 
 _EMAIL_BOX = (4, 4, 60, 20)
@@ -258,6 +264,58 @@ def test_published_frame_is_masked():
     _, _, out = publisher.frames[0]
     x0, y0, x1, y1 = _EMAIL_BOX
     assert (out[y0:y1, x0:x1, 0:3] == 0).all()
+
+
+def _page(fill: int = 210) -> np.ndarray:
+    """A larger blank frame that the 128x128 signature can pool meaningfully."""
+    frame = np.full((720, 1280, 4), fill, dtype=np.uint8)
+    frame[..., 3] = 255
+    return frame
+
+
+def _with_text_line(frame: np.ndarray) -> np.ndarray:
+    """Add one dark 12px-tall line, ~0.3% of frame area, like a line of text."""
+    out = frame.copy()
+    out[300:312, 100:520, 0:3] = 20
+    return out
+
+
+def test_identical_frames_are_unchanged():
+    a = frame_signature(_page())
+    b = frame_signature(_page())
+    assert unchanged(a, b) is True
+
+
+def test_new_text_line_is_detected_as_changed():
+    """The reported failure: a single line appearing scored ~0 under the old
+    mean-of-subsample comparator and was skipped."""
+    before = frame_signature(_page())
+    after = frame_signature(_with_text_line(_page()))
+    assert unchanged(before, after) is False
+
+
+def test_thin_line_between_subsample_rows_is_detected():
+    """At Retina size a 16px line can fall entirely between the rows a strided
+    subsample would keep; area pooling must still see it."""
+    base = np.full((1964, 3024, 4), 210, dtype=np.uint8)
+    base[..., 3] = 255
+    changed = base.copy()
+    # Row 1005 sits between multiples of 1964//64 == 30 (990, 1020).
+    changed[1005:1021, 400:1200, 0:3] = 20
+    assert unchanged(frame_signature(base), frame_signature(changed)) is False
+
+
+def test_max_skip_age_forces_reocr_on_a_static_screen():
+    recognizer = FakeRecognizer()
+    pipeline, _, state = _pipeline(recognizer)
+    state.go_live()
+
+    for seq in range(_MAX_SKIP_FRAMES + 2):
+        pipeline.process(_page(), seq + 1, state.epoch)
+
+    # One OCR to establish the frame, one forced after _MAX_SKIP_FRAMES skips.
+    assert recognizer.calls == 2
+    assert pipeline.republished == _MAX_SKIP_FRAMES
 
 
 def test_unchanged_frame_republishes_the_sanitized_frame():

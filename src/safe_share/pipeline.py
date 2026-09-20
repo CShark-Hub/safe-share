@@ -17,14 +17,18 @@ from collections.abc import Callable
 from typing import Protocol
 
 import numpy as np
+from PIL import Image
 
 from .detect import RuleDetector
 from .redact import redact
 from .types import OcrLine
 
 # Unchanged-frame skip: re-OCR'ing identical pixels wastes the frame budget.
-_SIG_SIZE = 64
-_SIG_DIFF_THRESH = 2.0
+_SIG_SIZE = 128
+_SIG_DIFF_THRESH = 4.0
+# Force a full re-OCR at least this often so a comparator miss cannot freeze the
+# output indefinitely while the real screen moves on.
+_MAX_SKIP_FRAMES = 15
 
 
 class Recognizer(Protocol):
@@ -90,18 +94,27 @@ class SessionState:
 
 
 def frame_signature(frame: np.ndarray) -> np.ndarray:
-    """Cheap luma thumbnail for change detection (subsample + channel mean)."""
-    h, w = frame.shape[:2]
-    sy, sx = max(1, h // _SIG_SIZE), max(1, w // _SIG_SIZE)
-    return frame[::sy, ::sx, :3].mean(axis=2).astype(np.float32)
+    """Box-pooled luma thumbnail for change detection.
+
+    Area pooling, not subsampling: a change confined to a few pixels still moves
+    the cell covering it, so a single new text line cannot fall between samples.
+    Channel order is irrelevant to change detection, so BGRA is read as RGBA.
+    """
+    img = Image.fromarray(frame, mode="RGBA").convert("L")
+    img = img.resize((_SIG_SIZE, _SIG_SIZE), Image.BOX)
+    return np.asarray(img, dtype=np.float32)
 
 
 def unchanged(a: np.ndarray | None, b: np.ndarray) -> bool:
-    """True if `b` matches the last processed signature `a` within threshold."""
+    """True only if no cell moved by more than the threshold.
+
+    Max per cell, not mean: a text line is a small fraction of frame area and a
+    mean would average it away.
+    """
     return (
         a is not None
         and a.shape == b.shape
-        and float(np.abs(a - b).mean()) < _SIG_DIFF_THRESH
+        and float(np.abs(a - b).max()) < _SIG_DIFF_THRESH
     )
 
 
@@ -136,6 +149,7 @@ class FramePipeline:
         self._last_sig: np.ndarray | None = None
         self._last_masked: np.ndarray | None = None
         self._last_epoch: int | None = None
+        self._skips = 0  # consecutive republishes, capped by _MAX_SKIP_FRAMES
 
         # Counts only: no frame content and no recognized text.
         self.dropped_stale = 0
@@ -224,14 +238,20 @@ class FramePipeline:
             self._last_sig = None
             self._last_masked = None
             self._last_epoch = epoch
+            self._skips = 0
 
         sig = frame_signature(frame)
         last_masked = self._last_masked
-        if last_masked is not None and unchanged(self._last_sig, sig):
+        if (
+            last_masked is not None
+            and self._skips < _MAX_SKIP_FRAMES
+            and unchanged(self._last_sig, sig)
+        ):
             # Republish the last SANITIZED frame: never re-apply old geometry to
             # new pixels, never publish this frame raw.
             if self._emit(epoch, seq, last_masked):
                 self.republished += 1
+                self._skips += 1
             return
 
         try:
@@ -256,6 +276,7 @@ class FramePipeline:
             self.published += 1
             self._last_sig = sig
             self._last_masked = masked
+            self._skips = 0
 
     def _emit(self, epoch: int, seq: int, masked: np.ndarray) -> bool:
         """Publish unless the epoch was invalidated while this frame was worked on."""
