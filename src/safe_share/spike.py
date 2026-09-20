@@ -43,6 +43,27 @@ from .redact import redact
 
 _NEUTRAL_RGBA = (0.10, 0.10, 0.10, 1.0)
 
+# Unchanged-frame skip: re-OCR'ing identical pixels wastes the frame budget.
+_SIG_SIZE = 64
+_SIG_DIFF_THRESH = 2.0
+
+
+def _frame_signature(frame: np.ndarray) -> np.ndarray:
+    """Cheap luma thumbnail for change detection (subsample + channel mean)."""
+    h, w = frame.shape[:2]
+    sy, sx = max(1, h // _SIG_SIZE), max(1, w // _SIG_SIZE)
+    return frame[::sy, ::sx, :3].mean(axis=2).astype(np.float32)
+
+
+def _unchanged(a: np.ndarray | None, b: np.ndarray) -> bool:
+    """True if `b` matches the last processed signature `a` within threshold.
+    Threshold ignores cursor blink; a real change re-triggers OCR."""
+    return (
+        a is not None
+        and a.shape == b.shape
+        and float(np.abs(a - b).mean()) < (_SIG_DIFF_THRESH)
+    )
+
 
 def _cgimage_from_bgra(arr: np.ndarray):
     """Build a CGImage from a BGRA array; returns (cgimage, arr).
@@ -202,6 +223,8 @@ class SafeShareSpike:
         # One recognizer per worker thread (Vision request built per call).
         recognizer = TextRecognizer()
         detector = RuleDetector(self._rule_config)
+        last_sig = None  # signature of the last frame we actually OCR'd
+        last_payload = None  # (cgimage, pinned_array) of the last sanitized frame
         while not self._worker_stop.is_set():
             if not self._frame_ready.wait(0.5):
                 continue
@@ -213,6 +236,17 @@ class SafeShareSpike:
                 continue
             # Stamp epoch now; a later pause/stop bumps it and drops the publish.
             epoch = self._presenter.currentEpoch()
+
+            sig = _frame_signature(frame)
+            if last_payload is not None and _unchanged(last_sig, sig):
+                # Unchanged: republish the last SANITIZED frame. Never re-apply
+                # old geometry to the new raw frame, and never publish it raw.
+                cg, pinned = last_payload
+                AppHelper.callAfter(
+                    self._presenter.publishPayload_, (epoch, cg, pinned)
+                )
+                continue
+
             try:
                 lines = recognizer.recognize(frame)
                 detections = detector.detect([ln.text for ln in lines])
@@ -222,11 +256,16 @@ class SafeShareSpike:
                 # publish neutral, never the raw or partially processed frame.
                 print(f"[pipeline] frame failed: {type(exc).__name__}", file=sys.stderr)
                 AppHelper.callAfter(self._presenter.publishNeutralForEpoch_, epoch)
+                last_sig = None  # do not skip after a failure; reprocess next frame
+                last_payload = None
                 continue
+
             cg, pinned = _cgimage_from_bgra(masked)
             # callAfter passes the Python tuple to the main thread without ObjC
             # container coercion, so `pinned` stays alive to back the CGImage.
             AppHelper.callAfter(self._presenter.publishPayload_, (epoch, cg, pinned))
+            last_sig = sig
+            last_payload = (cg, pinned)
 
     def request_pause(self) -> None:
         print("[controls] pause")
