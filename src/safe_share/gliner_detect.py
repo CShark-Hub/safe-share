@@ -1,4 +1,4 @@
-"""GLiNER person/organization detection. Needs the `ml` extra; loads from the
+"""GLiNER person-name detection. Needs the `ml` extra; loads from the
 local cache only, except `fetch_model()`."""
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ MODEL_VARIANT = "fp16"  # safetensors; the repo default is a pickle
 BACKBONE_ID = "microsoft/deberta-v3-small"
 BACKBONE_REVISION = "a36c739020e01763fe789b4b85e2df55d6180012"
 
-LABELS = ("person", "organization")
+LABELS = ("person",)  # organization also hits public brands and UI; clients go in `terms`
 # Words as gliner counts them (its WhitespaceTokenSplitter): punctuation is a word.
 _WORD = re.compile(r"\w+(?:[-_]\w+)*|\S")
 # Far under gliner's 768-word max_len, which truncates (a silent miss); small

@@ -22,7 +22,7 @@ _EXAMPLE = _ROOT / "safe_share.example.toml"
 @dataclass(frozen=True)
 class AppConfig:
     rules: RuleConfig
-    gliner: bool  # add model-based person/organization detection
+    gliner: bool  # add model-based person-name detection
     source: str  # file used, or "defaults"
 
 

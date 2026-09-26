@@ -9,6 +9,6 @@ credentials = true
 # Exact private terms/names to redact (case-insensitive, whole-word).
 terms = ["Maya Chen", "Project Halibut", "Northwind"]
 
-# Model-based person/organization detection (needs `uv sync --extra ml` and the
+# Model-based person-name detection (needs `uv sync --extra ml` and the
 # cached model; falls back to rules only if either is missing).
 gliner = true
