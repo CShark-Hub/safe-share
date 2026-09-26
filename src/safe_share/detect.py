@@ -43,6 +43,16 @@ class Detector(Protocol):
     def detect(self, texts: list[str]) -> list[Detection]: ...
 
 
+class UnionDetector:
+    """Runs every detector; a span flagged by any of them is kept."""
+
+    def __init__(self, *detectors: Detector) -> None:
+        self._detectors = detectors
+
+    def detect(self, texts: list[str]) -> list[Detection]:
+        return [d for det in self._detectors for d in det.detect(texts)]
+
+
 @dataclass
 class RuleConfig:
     emails: bool = True

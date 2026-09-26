@@ -19,7 +19,9 @@ class WordDetector:
 
     def detect(self, texts: list[str]) -> list[Detection]:
         return [
-            Detection(i, t.index(self._word), t.index(self._word) + len(self._word), "person")
+            Detection(
+                i, t.index(self._word), t.index(self._word) + len(self._word), "person"
+            )
             for i, t in enumerate(texts)
             if self._word in t
         ]
@@ -42,7 +44,12 @@ def fixtures(tmp_path: Path) -> Path:
                             {"line": 2, "text": "Bo", "type": "person"},
                         ],
                     },
-                    {"id": "neg", "tags": ["ui"], "lines": ["Ada Lovelace Bridge"], "expect": []},
+                    {
+                        "id": "neg",
+                        "tags": ["ui"],
+                        "lines": ["Ada Lovelace Bridge"],
+                        "expect": [],
+                    },
                 ],
             }
         )

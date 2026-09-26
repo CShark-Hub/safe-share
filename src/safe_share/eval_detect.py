@@ -3,18 +3,20 @@
 Pure text, no screen. Reports per-type span recall/precision, false positives, an
 exposure count (expected spans not fully covered by the union of detections),
 and line-level numbers, since redaction covers a whole line on any hit.
-Run: python -m safe_share.eval_detect [fixtures.json]
+Run: python -m safe_share.eval_detect [fixtures.json] [--detector gliner|union]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .detect import Detection, Detector, RuleConfig, RuleDetector
+from .detect import Detection, Detector, RuleConfig, RuleDetector, UnionDetector
+from .gliner_detect import THRESHOLD
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "detect" / "cases.json"
 
@@ -78,6 +80,106 @@ def _ratio(n: int, d: int) -> str:
     return f"{n}/{d} ({n / d:.0%})" if d else "-"
 
 
+@dataclass
+class Report:
+    recall_hit: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    recall_tot: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    prec_hit: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    prec_tot: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    exposures: list[str] = field(default_factory=list)
+    false_positives: list[tuple[str, str]] = field(default_factory=list)
+    lines_all: _LineTally = field(default_factory=_LineTally)
+    lines_by_type: dict[str, _LineTally] = field(
+        default_factory=lambda: defaultdict(_LineTally)
+    )
+    lines_by_tag: dict[str, _LineTally] = field(
+        default_factory=lambda: defaultdict(_LineTally)
+    )
+
+
+def evaluate(data: dict, detector: Detector) -> Report:
+    r = Report()
+    for case in data["cases"]:
+        lines = case["lines"]
+        expected = [_resolve_expected(e, lines) for e in case["expect"]]
+        found = detector.detect(lines)
+
+        positive_lines = {e.line for e in expected}
+        hit_lines = {d.line_index for d in found}
+        for i in range(len(lines)):
+            positive, hit = i in positive_lines, i in hit_lines
+            r.lines_all.add(positive, hit)
+            for tag in case.get("tags", []):
+                r.lines_by_tag[tag].add(positive, hit)
+        for etype, line in {(e.type, e.line) for e in expected}:
+            r.lines_by_type[f"type:{etype}"].add(True, line in hit_lines)
+
+        for e in expected:
+            r.recall_tot[e.type] += 1
+            if _fully_covered(e, found, same_type=True):
+                r.recall_hit[e.type] += 1
+            if not _fully_covered(e, found, same_type=False):
+                r.exposures.append(f"{case['id']} (line {e.line}, {e.type})")
+
+        all_negative = not expected
+        for d in found:
+            r.prec_tot[d.entity_type] += 1
+            hit = any(
+                d.line_index == e.line
+                and _overlap(d.start, d.end, e.start, e.end)
+                and d.entity_type == e.type
+                for e in expected
+            )
+            if hit:
+                r.prec_hit[d.entity_type] += 1
+            elif not any(
+                d.line_index == e.line and _overlap(d.start, d.end, e.start, e.end)
+                for e in expected
+            ):
+                # Snippets only for all-negative cases, which are synthetic
+                # non-secrets by construction (privacy rule 6).
+                if all_negative:
+                    snippet = lines[d.line_index][d.start : d.end][:32]
+                    r.false_positives.append((case["id"], f"{d.entity_type}:{snippet}"))
+                else:
+                    r.false_positives.append(
+                        (
+                            case["id"],
+                            f"{d.entity_type}@L{d.line_index}:{d.start}-{d.end}",
+                        )
+                    )
+    return r
+
+
+def print_report(r: Report) -> None:
+    types = sorted(set(r.recall_tot) | set(r.prec_tot))
+    print(f"{'type':<16}{'recall':>12}{'precision':>14}")
+    for t in types:
+        rt, ph, pt = r.recall_tot[t], r.prec_hit[t], r.prec_tot[t]
+        rec = f"{r.recall_hit[t]}/{rt}" if rt else "-"
+        prc = f"{ph}/{pt}" if pt else "-"
+        print(f"{t:<16}{rec:>12}{prc:>14}")
+
+    print(f"\n{'lines':<16}{'covered':>18}{'wrongly masked':>20}")
+    rows = [
+        ("all", r.lines_all),
+        *sorted(r.lines_by_type.items()),
+        *sorted(r.lines_by_tag.items()),
+    ]
+    for name, t in rows:
+        print(
+            f"{name:<16}{_ratio(t.pos_covered, t.pos_total):>18}"
+            f"{_ratio(t.neg_flagged, t.neg_total):>20}"
+        )
+
+    print(f"\nexposures (leaks): {len(r.exposures)}")
+    for x in r.exposures:
+        print(f"  - {x}")
+    print(f"false positives: {len(r.false_positives)}")
+    for cid, s in r.false_positives:
+        print(f"  - {cid}: {s}")
+
+
 def run(fixtures: Path = _FIXTURES, detector: Detector | None = None) -> int:
     if not fixtures.exists():
         print(
@@ -90,98 +192,40 @@ def run(fixtures: Path = _FIXTURES, detector: Detector | None = None) -> int:
     data = json.loads(fixtures.read_text())
     if detector is None:
         detector = RuleDetector(RuleConfig(terms=data.get("terms", [])))
+    r = evaluate(data, detector)
+    print_report(r)
+    return 1 if r.exposures or r.false_positives else 0
 
-    recall_hit: dict[str, int] = defaultdict(int)
-    recall_tot: dict[str, int] = defaultdict(int)
-    prec_hit: dict[str, int] = defaultdict(int)
-    prec_tot: dict[str, int] = defaultdict(int)
-    exposures: list[str] = []
-    false_positives: list[tuple[str, str]] = []  # (case id, snippet)
-    lines_all = _LineTally()
-    lines_by_tag: dict[str, _LineTally] = defaultdict(_LineTally)
-    lines_by_type: dict[str, _LineTally] = defaultdict(_LineTally)
 
-    for case in data["cases"]:
-        lines = case["lines"]
-        expected = [_resolve_expected(e, lines) for e in case["expect"]]
-        found = detector.detect(lines)
+def _build_detector(args: argparse.Namespace, fixtures: Path) -> Detector | None:
+    if args.detector == "rules":
+        return None
+    from .gliner_detect import GlinerDetector, load_model
 
-        positive_lines = {e.line for e in expected}
-        hit_lines = {d.line_index for d in found}
-        for i in range(len(lines)):
-            positive, hit = i in positive_lines, i in hit_lines
-            lines_all.add(positive, hit)
-            for tag in case.get("tags", []):
-                lines_by_tag[tag].add(positive, hit)
-        for etype, line in {(e.type, e.line) for e in expected}:
-            lines_by_type[f"type:{etype}"].add(True, line in hit_lines)
+    gliner = GlinerDetector(
+        load_model(device=args.device, dtype=args.dtype),
+        threshold=args.threshold,
+        lines_per_chunk=args.lines_per_chunk,
+    )
+    if args.detector == "gliner":
+        return gliner
+    terms = (
+        json.loads(fixtures.read_text()).get("terms", []) if fixtures.exists() else []
+    )
+    return UnionDetector(RuleDetector(RuleConfig(terms=terms)), gliner)
 
-        for e in expected:
-            recall_tot[e.type] += 1
-            if _fully_covered(e, found, same_type=True):
-                recall_hit[e.type] += 1
-            if not _fully_covered(e, found, same_type=False):
-                exposures.append(f"{case['id']} (line {e.line}, {e.type})")
 
-        all_negative = not expected
-        for d in found:
-            prec_tot[d.entity_type] += 1
-            hit = any(
-                d.line_index == e.line
-                and _overlap(d.start, d.end, e.start, e.end)
-                and d.entity_type == e.type
-                for e in expected
-            )
-            if hit:
-                prec_hit[d.entity_type] += 1
-            elif not any(
-                d.line_index == e.line and _overlap(d.start, d.end, e.start, e.end)
-                for e in expected
-            ):
-                # A detection over clean content is a false positive. Snippet
-                # text is logged only for all-negative cases, whose lines are
-                # synthetic non-secrets by construction (privacy rule 6);
-                # mixed cases report type + coordinates only.
-                if all_negative:
-                    snippet = lines[d.line_index][d.start : d.end][:32]
-                    false_positives.append((case["id"], f"{d.entity_type}:{snippet}"))
-                else:
-                    false_positives.append(
-                        (
-                            case["id"],
-                            f"{d.entity_type}@L{d.line_index}:{d.start}-{d.end}",
-                        )
-                    )
-
-    types = sorted(set(recall_tot) | set(prec_tot))
-    print(f"{'type':<16}{'recall':>12}{'precision':>14}")
-    for t in types:
-        rt, ph, pt = recall_tot[t], prec_hit[t], prec_tot[t]
-        rec = f"{recall_hit[t]}/{rt}" if rt else "-"
-        prc = f"{ph}/{pt}" if pt else "-"
-        print(f"{t:<16}{rec:>12}{prc:>14}")
-
-    print(f"\n{'lines':<16}{'covered':>18}{'wrongly masked':>20}")
-    rows = [
-        ("all", lines_all),
-        *sorted(lines_by_type.items()),
-        *sorted(lines_by_tag.items()),
-    ]
-    for name, t in rows:
-        print(
-            f"{name:<16}{_ratio(t.pos_covered, t.pos_total):>18}"
-            f"{_ratio(t.neg_flagged, t.neg_total):>20}"
-        )
-
-    print(f"\nexposures (leaks): {len(exposures)}")
-    for x in exposures:
-        print(f"  - {x}")
-    print(f"false positives: {len(false_positives)}")
-    for cid, s in false_positives:
-        print(f"  - {cid}: {s}")
-
-    return 1 if exposures or false_positives else 0
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m safe_share.eval_detect")
+    ap.add_argument("fixtures", nargs="?", type=Path, default=_FIXTURES)
+    ap.add_argument("--detector", choices=["rules", "gliner", "union"], default="rules")
+    ap.add_argument("--threshold", type=float, default=THRESHOLD)
+    ap.add_argument("--lines-per-chunk", type=int, default=None)
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--dtype", choices=["float32", "float16"], default="float32")
+    args = ap.parse_args(argv)
+    return run(args.fixtures, _build_detector(args, args.fixtures))
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(Path(sys.argv[1])) if len(sys.argv) > 1 else run())
+    raise SystemExit(main())
