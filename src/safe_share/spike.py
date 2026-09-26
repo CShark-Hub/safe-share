@@ -9,9 +9,11 @@ Run:  python -m safe_share.spike   (needs Screen Recording permission)
 
 from __future__ import annotations
 
+import atexit
 import signal
 import sys
 import threading
+import time
 
 import numpy as np
 import objc
@@ -39,9 +41,9 @@ from Quartz import CATransaction
 
 from .capture import CaptureError, DisplayCapture
 from .capture_errors import StopDisposition
-from .config import load_rule_config
+from .config import load_config
 from .control_state import button_enablement, control_state, status_text
-from .detect import RuleConfig, RuleDetector
+from .detect import Detector, RuleConfig, RuleDetector, UnionDetector
 from .ocr import TextRecognizer
 from .pipeline import FramePipeline, SessionState
 
@@ -180,6 +182,7 @@ class SafeShareSpike:
         self._refresh_timer = None
         self._capture: DisplayCapture | None = None
         self._rule_config = RuleConfig()
+        self._detector_note = "rules only"
         self._state = SessionState()
         self._pipeline: FramePipeline | None = None
         self._worker: threading.Thread | None = None
@@ -342,7 +345,31 @@ class SafeShareSpike:
         for name, button in self._buttons.items():
             button.setEnabled_(enabled[name])
         if self._status_label is not None:
-            self._status_label.setStringValue_(status_text(state))
+            self._status_label.setStringValue_(
+                f"{status_text(state)} · {self._detector_note}"
+            )
+
+    def _build_detector(self, use_gliner: bool) -> Detector:
+        """Rules, plus GLiNER when enabled and loadable; never downloads."""
+        rules = RuleDetector(self._rule_config)
+        if not use_gliner:
+            return rules
+        try:
+            from .gliner_detect import GlinerDetector, ModelUnavailable, load_best
+
+            t = time.monotonic()
+            model, where = load_best()
+        except ImportError:
+            print("[detect] GLiNER not installed (uv sync --extra ml); rules only")
+            return rules
+        except ModelUnavailable as exc:
+            print(f"[detect] GLiNER unavailable ({exc}); rules only")
+            return rules
+        print(
+            f"[detect] rules + GLiNER on {where}, loaded in {time.monotonic() - t:.1f}s"
+        )
+        self._detector_note = "rules + GLiNER"
+        return UnionDetector(rules, GlinerDetector(model))
 
     def run(self) -> int:
         self._app = NSApplication.sharedApplication()
@@ -362,12 +389,15 @@ class SafeShareSpike:
         presenter = self._build_windows()
         self._app.activate()
 
-        self._rule_config, cfg_source = load_rule_config()
+        config = load_config()
+        self._rule_config = config.rules
         print(
-            f"[config] source={cfg_source} emails={self._rule_config.emails} "
-            f"credentials={self._rule_config.credentials} "
-            f"terms={len(self._rule_config.terms)}"
+            f"[config] source={config.source} emails={config.rules.emails} "
+            f"credentials={config.rules.credentials} "
+            f"terms={len(config.rules.terms)} gliner={config.gliner}"
         )
+        # Before capture starts, so the load stays outside the watchdog budget.
+        detector = self._build_detector(config.gliner)
 
         self._capture = DisplayCapture(self._on_frame, self._on_stop)
         try:
@@ -383,13 +413,15 @@ class SafeShareSpike:
 
         pipeline = FramePipeline(
             TextRecognizer(),
-            RuleDetector(self._rule_config),
+            detector,
             presenter,
             self._state,
             on_error=self._on_pipeline_error,
             on_session_stopped=self._on_session_stopped,
         )
         self._pipeline = pipeline
+        # Quit ends in NSApp.terminate_ (exit), so code after the event loop never runs.
+        atexit.register(lambda: print(pipeline.timing_summary()))
         self._worker = threading.Thread(target=pipeline.run, daemon=True)
         self._worker.start()
 

@@ -224,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["float32", "float16"], default="float32")
     args = ap.parse_args(argv)
+    if not args.fixtures.exists():
+        return run(args.fixtures)  # reports the missing file without loading a model
     return run(args.fixtures, _build_detector(args, args.fixtures))
 
 

@@ -4,7 +4,8 @@ local cache only, except `fetch_model()`."""
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+import re
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -18,9 +19,13 @@ BACKBONE_ID = "microsoft/deberta-v3-small"
 BACKBONE_REVISION = "a36c739020e01763fe789b4b85e2df55d6180012"
 
 LABELS = ("person", "organization")
-# Far under the 768-word max_len, so gliner never truncates (a silent miss);
-# small chunks are also faster (bench_detect).
+# Words as gliner counts them (its WhitespaceTokenSplitter): punctuation is a word.
+_WORD = re.compile(r"\w+(?:[-_]\w+)*|\S")
+# Far under gliner's 768-word max_len, which truncates (a silent miss); small
+# chunks are also faster (bench_detect).
 MAX_CHUNK_WORDS = 75
+# The backbone has 512 positions; the label prompt takes 7 subwords.
+MAX_CHUNK_SUBWORDS = 480
 THRESHOLD = 0.7  # measured on fixtures/detect/names.json
 
 
@@ -56,6 +61,7 @@ class GlinerDetector:
         self._max_words = max_chunk_words
         self._lines_per_chunk = lines_per_chunk
         self._batch_size = batch_size
+        self._subwords = _subword_counter(model)
 
     def detect(self, texts: list[str]) -> list[Detection]:
         chunks = self._chunk(texts)
@@ -80,34 +86,60 @@ class GlinerDetector:
         chunks: list[tuple[str, list[tuple[int, int]]]] = []
         parts: list[str] = []
         starts: list[tuple[int, int]] = []
-        words = 0
-        offset = 0
+        words = subwords = offset = 0
 
         def flush() -> None:
-            nonlocal parts, starts, words, offset
+            nonlocal parts, starts, words, subwords, offset
             if parts:
                 chunks.append(("\n".join(parts), starts))
-            parts, starts, words, offset = [], [], 0, 0
+            parts, starts, words, subwords, offset = [], [], 0, 0, 0
 
-        for i, line in enumerate(texts):
-            n = len(line.split())
-            if n == 0:
-                continue
-            if n > self._max_words:
+        split = [(i, _WORD.findall(line)) for i, line in enumerate(texts)]
+        split = [(i, w) for i, w in split if w]
+        sub = (
+            self._subwords([w for _, w in split])
+            if self._subwords
+            else [0] * len(split)
+        )
+        for (i, w), m in zip(split, sub, strict=True):
+            n = len(w)
+            if n > self._max_words or m > MAX_CHUNK_SUBWORDS:
                 # Fail, never truncate; the pipeline then publishes neutral.
                 raise ValueError("OCR line exceeds the model input budget")
-            full = words + n > self._max_words or (
-                self._lines_per_chunk is not None
-                and len(parts) >= self._lines_per_chunk
+            full = (
+                words + n > self._max_words
+                or subwords + m > MAX_CHUNK_SUBWORDS
+                or (
+                    self._lines_per_chunk is not None
+                    and len(parts) >= self._lines_per_chunk
+                )
             )
             if full:
                 flush()
             starts.append((i, offset))
-            parts.append(line)
+            parts.append(texts[i])
             words += n
-            offset += len(line) + 1
+            subwords += m
+            offset += len(texts[i]) + 1
         flush()
         return chunks
+
+
+def _subword_counter(model: object) -> Callable[[list[list[str]]], list[int]] | None:
+    """Subwords per line from the model's tokenizer; None for models without one."""
+    tok = getattr(getattr(model, "data_processor", None), "transformer_tokenizer", None)
+    if tok is None:
+        return None
+
+    def count(lines: list[list[str]]) -> list[int]:
+        if not lines:
+            return []
+        ids = tok(lines, is_split_into_words=True, add_special_tokens=False)[
+            "input_ids"
+        ]
+        return [len(x) for x in ids]
+
+    return count
 
 
 def _split_to_lines(
@@ -133,9 +165,23 @@ def _split_to_lines(
     return out
 
 
-def _check_backbone_pinned() -> None:
+def _check_cache() -> None:
+    """Offline mode active, backbone ref pinned, fp16 weights present (so gliner
+    cannot fall back to the repo's pickle)."""
+    from huggingface_hub import constants
     from huggingface_hub.constants import HF_HUB_CACHE
 
+    if not constants.HF_HUB_OFFLINE:
+        raise ModelUnavailable("offline mode is not active")
+    weights = (
+        Path(HF_HUB_CACHE)
+        / f"models--{MODEL_ID.replace('/', '--')}"
+        / "snapshots"
+        / MODEL_REVISION
+        / f"model.{MODEL_VARIANT}.safetensors"
+    )
+    if not weights.exists():
+        raise ModelUnavailable("model is not cached")
     ref = (
         Path(HF_HUB_CACHE)
         / f"models--{BACKBONE_ID.replace('/', '--')}"
@@ -153,20 +199,26 @@ def _check_backbone_pinned() -> None:
 def _quiet_libraries() -> None:
     import warnings
 
+    # Filters first: importing transformers imports torch, which warns.
+    warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.")
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"huggingface_hub\.")
     import transformers
 
     transformers.logging.set_verbosity_error()
-    warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch\.")
+
+
+def _force_offline() -> None:
+    # Read by huggingface_hub at import time; _check_cache verifies it took.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 
 def load_model(device: str = "cpu", dtype: str = "float32") -> Any:
     """Load the pinned model from the local cache; `dtype` is float16 or float32."""
-    # Read by huggingface_hub at import time.
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    _force_offline()
     _quiet_libraries()
-    _check_backbone_pinned()
+    _check_cache()
 
     import torch
     from gliner import GLiNER
@@ -185,6 +237,29 @@ def load_model(device: str = "cpu", dtype: str = "float32") -> Any:
     model.to(dtype=getattr(torch, dtype))
     model.eval()
     return model
+
+
+def load_best() -> tuple[Any, str]:
+    """MPS fp16 if it loads and finds a name, else CPU fp32. Returns (model, "device/dtype")."""
+    _force_offline()
+    import torch
+
+    options = [("cpu", "float32")]
+    if torch.backends.mps.is_available():
+        options.insert(0, ("mps", "float16"))
+    for device, dtype in options:
+        try:
+            model = load_model(device, dtype)
+            found = GlinerDetector(model).detect(["Meeting with Priya Venkat at noon"])
+            # A model that runs but finds nothing (e.g. fp16 overflow) is a failure.
+            if not any(d.entity_type == "person" for d in found):
+                raise RuntimeError("warm-up found no person")
+            return model, f"{device}/{dtype}"
+        except ModelUnavailable:
+            raise  # another device will not find a missing file either
+        except Exception as exc:  # noqa: BLE001 - try the next device
+            print(f"[detect] GLiNER failed on {device}/{dtype}: {type(exc).__name__}")
+    raise ModelUnavailable("model did not run on any device")
 
 
 def fetch_model() -> None:

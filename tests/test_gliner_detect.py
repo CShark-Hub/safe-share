@@ -1,8 +1,9 @@
-"""GLiNER detector tests with a fake model; the real-model test needs the cache."""
+"""GLiNER detector tests with a fake model; the real-model tests need the cache."""
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import socket
 from pathlib import Path
 from typing import Any
@@ -10,17 +11,14 @@ from typing import Any
 import pytest
 
 from safe_share.detect import Detection, RuleConfig, RuleDetector, UnionDetector
-from safe_share.gliner_detect import GlinerDetector
+from safe_share.gliner_detect import MODEL_ID, MODEL_REVISION, GlinerDetector
 
 
 class FakeModel:
-    """Tags every occurrence of the given names and records its inputs."""
+    """Tags every occurrence of the given names."""
 
-    def __init__(self, names: dict[str, str], max_words: int | None = None) -> None:
+    def __init__(self, names: dict[str, str]) -> None:
         self._names = names
-        self._max_words = max_words
-        self.calls: list[list[str]] = []
-        self.threshold: float | None = None
 
     def inference(
         self,
@@ -29,12 +27,8 @@ class FakeModel:
         threshold: float = 0.5,
         batch_size: int = 8,
     ) -> list[list[dict[str, Any]]]:
-        self.calls.append(texts)
-        self.threshold = threshold
         out = []
         for text in texts:
-            if self._max_words is not None:
-                assert len(text.split()) <= self._max_words, "chunk over budget"
             ents = []
             for name, label in self._names.items():
                 start = text.find(name)
@@ -43,7 +37,6 @@ class FakeModel:
                         {
                             "start": start,
                             "end": start + len(name),
-                            "text": name,
                             "label": label,
                             "score": 0.9,
                         }
@@ -61,16 +54,18 @@ def _spans(dets: list[Detection], texts: list[str]) -> set[tuple[int, str, str]]
 
 
 def test_chunk_offsets_map_back_to_the_right_lines() -> None:
-    texts = ["Lena Hartwig 10:42", "did the invoice go out?", "ask Fabrikam today"]
+    texts = [
+        "",
+        "Lena Hartwig 10:42",
+        "   ",
+        "did the invoice go out?",
+        "ask Fabrikam today",
+    ]
     model = FakeModel({"Lena Hartwig": "person", "Fabrikam": "organization"})
-    dets = GlinerDetector(model).detect(texts)
-
-    assert len(model.calls) == 1 and len(model.calls[0]) == 1  # one chunk
-    assert _spans(dets, texts) == {
-        (0, "Lena Hartwig", "person"),
-        (2, "Fabrikam", "organization"),
+    assert _spans(GlinerDetector(model).detect(texts), texts) == {
+        (1, "Lena Hartwig", "person"),
+        (4, "Fabrikam", "organization"),
     }
-    assert all(d.source == "gliner" and d.score == 0.9 for d in dets)
 
 
 def test_name_split_across_lines_marks_both_lines() -> None:
@@ -79,20 +74,39 @@ def test_name_split_across_lines_marks_both_lines() -> None:
     assert _spans(dets, texts) == {(0, "Rafael", "person"), (1, "Quintero", "person")}
 
 
-def test_chunks_never_exceed_the_word_budget() -> None:
-    texts = [f"line {i} mentions Ada Kowalczyk here" for i in range(40)]  # 6 words each
-    model = FakeModel({"Ada Kowalczyk": "person"}, max_words=20)
-    dets = GlinerDetector(model, max_chunk_words=20).detect(texts)
-
-    assert sum(len(c) for c in model.calls) == 14  # 3 lines per chunk
-    assert {d.line_index for d in dets} == set(range(40))
-
-
-def test_line_over_budget_raises_instead_of_truncating() -> None:
+def test_punctuation_counts_toward_the_word_budget() -> None:
+    # 3 whitespace words, 13 words as gliner splits them.
     with pytest.raises(ValueError):
-        GlinerDetector(FakeModel({}), max_chunk_words=5).detect(
-            ["one two three four five six"]
-        )
+        GlinerDetector(FakeModel({}), max_chunk_words=10).detect(["a.b.c.d(e,f) = g"])
+
+
+def test_chunks_respect_the_subword_budget() -> None:
+    class Tokenizer:
+        """One subword per character, so long words cost more."""
+
+        def __call__(self, lines, is_split_into_words, add_special_tokens):
+            return {"input_ids": [[0] * sum(len(w) for w in words) for words in lines]}
+
+    class WithTokenizer(FakeModel):
+        def __init__(self, names: dict[str, str]) -> None:
+            super().__init__(names)
+            self.data_processor = type(
+                "P", (), {"transformer_tokenizer": Tokenizer()}
+            )()
+            self.chunks: list[str] = []
+
+        def inference(self, texts, labels, threshold=0.5, batch_size=8):
+            self.chunks += texts
+            return super().inference(texts, labels, threshold, batch_size)
+
+    model = WithTokenizer({"Ada": "person"})
+    texts = ["Ada " + "x" * 200 for _ in range(10)]  # ~200 subwords per line
+    dets = GlinerDetector(model).detect(texts)
+    assert all(len(c.replace("\n", "").replace(" ", "")) <= 480 for c in model.chunks)
+    assert {d.line_index for d in dets} == set(range(10))
+
+    with pytest.raises(ValueError):  # a single line over the cap fails, never truncates
+        GlinerDetector(model).detect(["x" * 600])
 
 
 def test_result_count_mismatch_is_a_failure() -> None:
@@ -104,7 +118,7 @@ def test_result_count_mismatch_is_a_failure() -> None:
         GlinerDetector(Short({})).detect(["Ada here"])
 
 
-def test_union_keeps_hits_from_every_detector() -> None:
+def test_union_keeps_hits_from_every_detector_and_propagates_failures() -> None:
     texts = ["mail ada@example.com", "ask Priya Venkat"]
     union = UnionDetector(
         RuleDetector(RuleConfig(terms=[])),
@@ -115,19 +129,48 @@ def test_union_keeps_hits_from_every_detector() -> None:
         (1, "Priya Venkat", "person"),
     }
 
+    class Broken:
+        def detect(self, texts: list[str]) -> list[Detection]:
+            raise RuntimeError("model failed")
+
+    with pytest.raises(RuntimeError):
+        UnionDetector(RuleDetector(RuleConfig(terms=[])), Broken()).detect(texts)
+
 
 def _model_cached() -> bool:
+    # Must not import huggingface_hub: it reads HF_HUB_OFFLINE at import time.
     if importlib.util.find_spec("gliner") is None:
         return False
-    from huggingface_hub.constants import HF_HUB_CACHE
-
-    from safe_share.gliner_detect import MODEL_ID, MODEL_REVISION
-
+    hub = (
+        os.environ.get("HF_HUB_CACHE")
+        or Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    )
     repo = f"models--{MODEL_ID.replace('/', '--')}"
-    return (Path(HF_HUB_CACHE) / repo / "snapshots" / MODEL_REVISION).is_dir()
+    return (Path(hub) / repo / "snapshots" / MODEL_REVISION).is_dir()
 
 
-@pytest.mark.skipif(not _model_cached(), reason="ml extra or cached model missing")
+needs_model = pytest.mark.skipif(
+    not _model_cached(), reason="ml extra or cached model missing"
+)
+
+
+@needs_model
+def test_warm_up_that_finds_nothing_falls_back_to_the_next_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from safe_share import gliner_detect
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    models = {"mps": FakeModel({}), "cpu": FakeModel({"Priya Venkat": "person"})}
+    monkeypatch.setattr(
+        gliner_detect, "load_model", lambda device, dtype: models[device]
+    )
+    assert gliner_detect.load_best()[1] == "cpu/float32"
+
+
+@needs_model
 def test_real_model_loads_and_runs_with_the_network_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

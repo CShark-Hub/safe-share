@@ -14,8 +14,10 @@ Invariants:
 
 from __future__ import annotations
 
+import statistics
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Protocol
 
@@ -196,6 +198,22 @@ class FramePipeline:
         self.republished = 0
         self.failed = 0
         self.watchdog_fired = 0
+        # (ocr_ms, detect_ms) per processed frame, bounded.
+        self._timings: deque[tuple[float, float]] = deque(maxlen=5000)
+
+    def timing_summary(self) -> str:
+        """OCR and detection time of processed frames: p50/p95/max in ms."""
+        if not self._timings:
+            return "[timing] no processed frames"
+        snap = list(self._timings)  # atomic copy; the worker may still append
+        parts = [f"[timing] processed={len(snap)}"]
+        for name, i in (("ocr", 0), ("detect", 1)):
+            ms = sorted(t[i] for t in snap)
+            p95 = ms[min(len(ms) - 1, int(0.95 * len(ms)))]
+            parts.append(
+                f"{name} p50={statistics.median(ms):.0f} p95={p95:.0f} max={ms[-1]:.0f}ms"
+            )
+        return " | ".join(parts)
 
     def submit(self, frame: np.ndarray) -> int:
         """Newest frame wins; an unprocessed older one is dropped.
@@ -355,9 +373,13 @@ class FramePipeline:
             return
 
         try:
+            t0 = time.perf_counter()
             lines = self._recognizer.recognize(frame)
+            t1 = time.perf_counter()
             detections = self._detector.detect([ln.text for ln in lines])
+            t2 = time.perf_counter()
             masked = redact(frame, lines, detections)
+            self._timings.append(((t1 - t0) * 1000, (t2 - t1) * 1000))
         except Exception as exc:  # noqa: BLE001 - any failure must go neutral
             # A failed run is not "no sensitive text". The exception message can
             # carry recognized text, so only its type is reported.

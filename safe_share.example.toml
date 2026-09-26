@@ -1,4 +1,4 @@
-# Safe Share rule-detector config (SYNTHETIC example).
+# Safe Share config (SYNTHETIC example).
 # Copy to `safe_share.toml` (gitignored) and put your real private terms there;
 # never commit real names or terms. Emails and credential shapes are detected
 # regardless of the terms list.
@@ -8,3 +8,7 @@ credentials = true
 
 # Exact private terms/names to redact (case-insensitive, whole-word).
 terms = ["Maya Chen", "Project Halibut", "Northwind"]
+
+# Model-based person/organization detection (needs `uv sync --extra ml` and the
+# cached model; falls back to rules only if either is missing).
+gliner = true
