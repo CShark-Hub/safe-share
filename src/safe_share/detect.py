@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Protocol
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,10 @@ class Detection:
     entity_type: str
     source: str = "rule"
     score: float | None = None
+
+
+class Detector(Protocol):
+    def detect(self, texts: list[str]) -> list[Detection]: ...
 
 
 @dataclass

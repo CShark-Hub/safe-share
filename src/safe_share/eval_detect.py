@@ -1,8 +1,9 @@
-"""String-level evaluation of the rule detector against repo fixtures.
+"""String-level evaluation of a detector against repo fixtures.
 
-Pure text, no screen. Reports per-type recall/precision, false positives, and an
-exposure count (expected spans not fully covered by the union of detections).
-Run: python -m safe_share.eval_detect
+Pure text, no screen. Reports per-type span recall/precision, false positives, an
+exposure count (expected spans not fully covered by the union of detections),
+and line-level numbers, since redaction covers a whole line on any hit.
+Run: python -m safe_share.eval_detect [fixtures.json]
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from .detect import Detection, RuleConfig, RuleDetector
+from .detect import Detection, Detector, RuleConfig, RuleDetector
 
 _FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "detect" / "cases.json"
 
@@ -57,7 +58,27 @@ def _fully_covered(e: Expected, dets: list[Detection], same_type: bool) -> bool:
     return cursor >= e.end
 
 
-def run(fixtures: Path = _FIXTURES) -> int:
+@dataclass
+class _LineTally:
+    pos_covered: int = 0
+    pos_total: int = 0
+    neg_flagged: int = 0
+    neg_total: int = 0
+
+    def add(self, positive: bool, hit: bool) -> None:
+        if positive:
+            self.pos_total += 1
+            self.pos_covered += hit
+        else:
+            self.neg_total += 1
+            self.neg_flagged += hit
+
+
+def _ratio(n: int, d: int) -> str:
+    return f"{n}/{d} ({n / d:.0%})" if d else "-"
+
+
+def run(fixtures: Path = _FIXTURES, detector: Detector | None = None) -> int:
     if not fixtures.exists():
         print(
             f"no fixtures at {fixtures}\n"
@@ -67,7 +88,8 @@ def run(fixtures: Path = _FIXTURES) -> int:
         )
         return 2
     data = json.loads(fixtures.read_text())
-    detector = RuleDetector(RuleConfig(terms=data.get("terms", [])))
+    if detector is None:
+        detector = RuleDetector(RuleConfig(terms=data.get("terms", [])))
 
     recall_hit: dict[str, int] = defaultdict(int)
     recall_tot: dict[str, int] = defaultdict(int)
@@ -75,11 +97,24 @@ def run(fixtures: Path = _FIXTURES) -> int:
     prec_tot: dict[str, int] = defaultdict(int)
     exposures: list[str] = []
     false_positives: list[tuple[str, str]] = []  # (case id, snippet)
+    lines_all = _LineTally()
+    lines_by_tag: dict[str, _LineTally] = defaultdict(_LineTally)
+    lines_by_type: dict[str, _LineTally] = defaultdict(_LineTally)
 
     for case in data["cases"]:
         lines = case["lines"]
         expected = [_resolve_expected(e, lines) for e in case["expect"]]
         found = detector.detect(lines)
+
+        positive_lines = {e.line for e in expected}
+        hit_lines = {d.line_index for d in found}
+        for i in range(len(lines)):
+            positive, hit = i in positive_lines, i in hit_lines
+            lines_all.add(positive, hit)
+            for tag in case.get("tags", []):
+                lines_by_tag[tag].add(positive, hit)
+        for etype, line in {(e.type, e.line) for e in expected}:
+            lines_by_type[f"type:{etype}"].add(True, line in hit_lines)
 
         for e in expected:
             recall_tot[e.type] += 1
@@ -126,6 +161,18 @@ def run(fixtures: Path = _FIXTURES) -> int:
         prc = f"{ph}/{pt}" if pt else "-"
         print(f"{t:<16}{rec:>12}{prc:>14}")
 
+    print(f"\n{'lines':<16}{'covered':>18}{'wrongly masked':>20}")
+    rows = [
+        ("all", lines_all),
+        *sorted(lines_by_type.items()),
+        *sorted(lines_by_tag.items()),
+    ]
+    for name, t in rows:
+        print(
+            f"{name:<16}{_ratio(t.pos_covered, t.pos_total):>18}"
+            f"{_ratio(t.neg_flagged, t.neg_total):>20}"
+        )
+
     print(f"\nexposures (leaks): {len(exposures)}")
     for x in exposures:
         print(f"  - {x}")
@@ -137,4 +184,4 @@ def run(fixtures: Path = _FIXTURES) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(run(Path(sys.argv[1])) if len(sys.argv) > 1 else run())

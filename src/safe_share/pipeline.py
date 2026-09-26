@@ -22,7 +22,7 @@ from typing import Protocol
 import numpy as np
 from PIL import Image
 
-from .detect import RuleDetector
+from .detect import Detector
 from .redact import redact
 from .types import OcrLine
 
@@ -145,7 +145,7 @@ class FramePipeline:
     def __init__(
         self,
         recognizer: Recognizer,
-        detector: RuleDetector,
+        detector: Detector,
         publisher: Publisher,
         state: SessionState,
         on_error: Callable[[str], None] | None = None,
