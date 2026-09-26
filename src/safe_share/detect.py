@@ -11,12 +11,15 @@ Covered:
   - provider key shapes: AWS AK/AS/AG/AI/AR..IA (incl. ASIA temp creds),
     GitHub gh[pousr]_, Slack xox[baprs]-, Google AIza, Stripe [sprk]k_live_
   - PEM private-key blocks (BEGIN..END, spanning lines), three-segment JWTs
-  - a secret value following a keyword (password/secret/token/api key = ...),
-    including the value-on-the-next-line case after an OCR line split
+  - a secret value after a keyword (password/secret/token/api key = ...), incl.
+    DB_PASSWORD=, quoted keys and a value on the next line; Authorization/Bearer
+    values; passwords in scheme://user:pass@host
+Credential rules match a copy of the line with case and OCR confusions folded.
 Not covered: free-form passwords with no marker, Stripe test keys, values that
 look like ordinary words. Misses here are misses, not "no sensitive text".
 Cross-line PEM coverage depends on OCR reading the words "BEGIN ... PRIVATE KEY"
 (dashes optional); if OCR garbles those words, the base64 body leaks.
+Not covered either: camelCase keys (dbPassword =).
 """
 
 from __future__ import annotations
@@ -64,37 +67,76 @@ class RuleConfig:
 
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
-# Single-line, self-contained key shapes; the whole match is the sensitive span.
+_FOLD_MAP = str.maketrans({"0": "o", "1": "l", "i": "l", "5": "s", "v": "y"})
+
+
+def _fold(text: str) -> str:
+    """Lowercase and fold OCR confusions, one char per char so spans map back."""
+    low = "".join(c.lower() if len(c.lower()) == 1 else c for c in text)
+    return low.translate(_FOLD_MAP)
+
+
+# Matched on folded text; the whole match is the span. Fixed lengths allow +-1
+# for a dropped or doubled OCR character.
+_AWS_PREFIXES = ("AKIA", "ASIA", "AGPA", "AIDA", "AROA", "AIPA", "ANPA", "ANVA")
 _KEY_SHAPES: list[tuple[str, re.Pattern[str]]] = [
     (
         "aws_key",
         re.compile(
-            r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{16}(?![0-9A-Za-z])"
+            rf"\b(?:{'|'.join(map(_fold, _AWS_PREFIXES))})[0-9a-z]{{15,17}}(?![0-9a-z])"
         ),
     ),
-    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}(?![0-9A-Za-z])")),
-    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}(?![0-9A-Za-z-])")),
+    (
+        "github_token",
+        re.compile(rf"\b{_fold('gh')}[pousr]_[0-9a-z]{{20,}}(?![0-9a-z])"),
+    ),
+    (
+        "slack_token",
+        re.compile(rf"\b{_fold('xox')}[baprs]-[0-9a-z-]{{10,}}(?![0-9a-z-])"),
+    ),
     # Trailing (?!class) not \b: a \b after a class containing -/_ fails when the
     # key ends in one of those, dropping the whole match and leaking the key.
-    ("google_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])")),
-    ("stripe_key", re.compile(r"\b(?:sk|pk|rk)_live_[0-9A-Za-z]{16,}(?![0-9A-Za-z])")),
+    ("google_key", re.compile(rf"\b{_fold('AIza')}[0-9a-z_-]{{34,36}}(?![0-9a-z_-])")),
+    (
+        "stripe_key",
+        re.compile(rf"\b(?:sk|pk|rk)_{_fold('live')}_[0-9a-z]{{15,}}(?![0-9a-z])"),
+    ),
     (
         "jwt",
         re.compile(
-            r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![0-9A-Za-z_-])"
+            rf"\b{_fold('eyJ')}[0-9a-z_-]+\.[0-9a-z_-]+\.[0-9a-z_-]+(?![0-9a-z_-])"
         ),
     ),
 ]
 
-_KEYED = re.compile(
-    r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|apikey|token)"
-    r"\s*[:=][ \t]*(?P<v>\S.*)?$"
+_KEYWORDS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api[_-]?key",
+    "apikey",
+    "access[_-]?key",
+    "private[_-]?key",
+    "credentials?",
+    "authorization",
 )
+# Keyword as a whole identifier segment, not a substring (tokenizer, max_tokens).
+_KEYED = re.compile(
+    r"(?<![0-9a-z])(?:[0-9a-z]+[_-])*"
+    rf"(?:{'|'.join(_fold(k) for k in _KEYWORDS)})"
+    r"(?:[_-][0-9a-z_-]*+)?[\"']?\s*[:=][ \t]*(?P<v>\S.*)?$"
+)
+_BEARER = re.compile(rf"\b{_fold('bearer')}\s+(?P<v>[0-9a-z._~+/=-]{{8,}})")
+_CONN_PASSWORD = re.compile(r"://[^/\s:@]*:(?P<v>[^@\s/]+)@")
 _LEADING_TOKEN = re.compile(r"\S+")
+# YAML block scalars and line continuations: the value is on the next line.
+_NEXT_LINE_MARKERS = frozenset({"|", "|-", ">", ">-", "\\"})
 # Key on the words, not the dashes: OCR renders "-----" unreliably (dropped,
 # merged, or read as a rule), so requiring literal dashes leaks the block.
-_PEM_BEGIN = re.compile(r"(?i)BEGIN[A-Z0-9 –—-]*PRIVATE KEY")
-_PEM_END = re.compile(r"(?i)END[A-Z0-9 –—-]*PRIVATE KEY")
+_PEM_BEGIN = re.compile(rf"{_fold('BEGIN')}[a-z0-9 –—-]*{_fold('PRIVATE KEY')}")
+_PEM_END = re.compile(rf"{_fold('END')}[a-z0-9 –—-]*{_fold('PRIVATE KEY')}")
 
 # Values after a keyword that are not secrets; masking these is only annoying,
 # but skipping them keeps demo precision up. Placeholder runs (****) also skip.
@@ -123,8 +165,8 @@ def _normalize(text: str) -> str:
 
 
 def _is_placeholder(value: str) -> bool:
-    v = value.strip().casefold()
-    return v in _NON_SECRET or bool(v) and set(v) <= set("*•●·.x")
+    v = value.strip().strip("\"',").strip().casefold()
+    return not v or v in _NON_SECRET or set(v) <= set("*•●·.x")
 
 
 def _compile_terms(terms: list[str]) -> re.Pattern[str] | None:
@@ -147,6 +189,7 @@ class RuleDetector:
 
     def detect(self, texts: list[str]) -> list[Detection]:
         lines = [_normalize(t) for t in texts]
+        folded = [_fold(t) for t in lines]
         out: list[Detection] = []
         for i, text in enumerate(lines):
             if self._config.emails:
@@ -160,31 +203,41 @@ class RuleDetector:
                     for m in self._terms.finditer(text)
                 ]
             if self._config.credentials:
-                self._detect_credentials(i, text, lines, out)
+                self._detect_credentials(i, text, folded, out)
         return out
 
     def _detect_credentials(
-        self, i: int, text: str, lines: list[str], out: list[Detection]
+        self, i: int, text: str, folded: list[str], out: list[Detection]
     ) -> None:
+        # Patterns run on the folded line; spans index the raw line 1:1.
+        f = folded[i]
         for etype, pat in _KEY_SHAPES:
-            out += [Detection(i, m.start(), m.end(), etype) for m in pat.finditer(text)]
+            out += [Detection(i, m.start(), m.end(), etype) for m in pat.finditer(f)]
 
-        if _PEM_BEGIN.search(text):
+        if _PEM_BEGIN.search(f):
             out.append(Detection(i, 0, len(text), "pem_key"))
-        elif _PEM_END.search(text) or self._inside_pem(i, lines):
+        elif _PEM_END.search(f) or self._inside_pem(i, folded):
             # Body/END line of a block whose BEGIN was on an earlier line.
             out.append(Detection(i, 0, len(text), "pem_key"))
 
-        m = _KEYED.search(text)
+        for pat in (_BEARER, _CONN_PASSWORD):
+            m = pat.search(f)
+            if m:
+                etype = "conn_password" if pat is _CONN_PASSWORD else "keyed_secret"
+                out.append(Detection(i, m.start("v"), m.end("v"), etype))
+
+        m = _KEYED.search(f)
         if m:
-            value = m.group("v")
+            value = text[m.start("v") : m.end("v")] if m.group("v") else None
+            if value is not None and value.strip() in _NEXT_LINE_MARKERS:
+                value = None
             if value and not _is_placeholder(value):
                 out.append(Detection(i, m.start("v"), m.end("v"), "keyed_secret"))
             elif not value:
                 # Value split onto the next line by OCR: cover the whole
                 # remainder, not just the first token (a secret may contain
                 # spaces, and a partial cover is a leak).
-                nxt = self._next_value_span(i, lines)
+                nxt = self._next_value_span(i, folded)
                 if nxt is not None:
                     j, s, e = nxt
                     out.append(Detection(j, s, e, "keyed_secret"))

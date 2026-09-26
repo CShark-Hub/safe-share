@@ -3,7 +3,8 @@
 Pure text, no screen. Reports per-type span recall/precision, false positives, an
 exposure count (expected spans not fully covered by the union of detections),
 and line-level numbers, since redaction covers a whole line on any hit.
-Run: python -m safe_share.eval_detect [fixtures.json] [--detector gliner|union]
+`--perturb` adds OCR-style variants of every credential span and reports them apart.
+Run: python -m safe_share.eval_detect [fixtures.json] [--detector gliner|union] [--perturb]
 """
 
 from __future__ import annotations
@@ -36,6 +37,59 @@ def _resolve_expected(exp: dict, lines: list[str]) -> Expected:
     text = exp["text"]
     start = lines[line].index(text)
     return Expected(line, start, start + len(text), exp["type"])
+
+
+_NOT_CREDENTIAL = {"email", "term", "person"}
+
+
+def _swap(s: str, pairs: list[tuple[str, str]]) -> str:
+    """Replace the first character found from `pairs` (tried in order)."""
+    for a, b in pairs:
+        i = s.find(a)
+        if i >= 0:
+            return s[:i] + b + s[i + 1 :]
+    return s
+
+
+def _flip_case(s: str) -> str:
+    for i in range(min(3, len(s)), len(s)):
+        if s[i].isalpha():
+            return s[:i] + s[i].swapcase() + s[i + 1 :]
+    return s
+
+
+_PERTURBATIONS = {
+    "case": _flip_case,
+    "y/v": lambda s: _swap(s, [("y", "v")]),
+    "O/0": lambda s: _swap(s, [("O", "0"), ("0", "O")]),
+    "l/1/I": lambda s: _swap(s, [("l", "1"), ("I", "l"), ("1", "l")]),
+    "S/5": lambda s: _swap(s, [("S", "5"), ("5", "S")]),
+    "drop": lambda s: s[: len(s) // 2] + s[len(s) // 2 + 1 :],
+}
+
+
+def perturb(data: dict) -> dict:
+    """One case per (credential span, OCR confusion) that changes the span."""
+    out = []
+    for case in data["cases"]:
+        for k, exp in enumerate(case["expect"]):
+            if exp["type"] in _NOT_CREDENTIAL:
+                continue
+            line = case["lines"][exp["line"]]
+            orig = line if exp.get("whole_line") else exp["text"]
+            for kind, fn in _PERTURBATIONS.items():
+                new = fn(orig)
+                if new == orig:
+                    continue
+                c = json.loads(json.dumps(case))
+                c["id"] = f"{case['id']}~{k}~{kind}"
+                c["lines"][exp["line"]] = line.replace(orig, new, 1)
+                # Score only the perturbed span; its siblings are the clean run's.
+                c["expect"] = [c["expect"][k]]
+                if not exp.get("whole_line"):
+                    c["expect"][0]["text"] = new
+                out.append(c)
+    return {**data, "cases": out}
 
 
 def _overlap(a_s: int, a_e: int, b_s: int, b_e: int) -> bool:
@@ -180,7 +234,11 @@ def print_report(r: Report) -> None:
         print(f"  - {cid}: {s}")
 
 
-def run(fixtures: Path = _FIXTURES, detector: Detector | None = None) -> int:
+def run(
+    fixtures: Path = _FIXTURES,
+    detector: Detector | None = None,
+    with_perturb: bool = False,
+) -> int:
     if not fixtures.exists():
         print(
             f"no fixtures at {fixtures}\n"
@@ -194,7 +252,25 @@ def run(fixtures: Path = _FIXTURES, detector: Detector | None = None) -> int:
         detector = RuleDetector(RuleConfig(terms=data.get("terms", [])))
     r = evaluate(data, detector)
     print_report(r)
+    if with_perturb:
+        _print_perturbed(evaluate(perturb(data), detector))
     return 1 if r.exposures or r.false_positives else 0
+
+
+def _print_perturbed(r: Report) -> None:
+    by_kind: dict[str, int] = defaultdict(int)
+    for x in r.exposures:
+        by_kind[x.split(" ")[0].rsplit("~", 1)[1]] += 1
+    total = sum(r.recall_tot.values())
+    print(
+        f"\nOCR-perturbed credential spans: {total - len(r.exposures)}/{total} covered"
+    )
+    print(
+        "  exposures by confusion: "
+        + ", ".join(f"{k} {v}" for k, v in sorted(by_kind.items()))
+    )
+    for x in r.exposures:
+        print(f"  - {x}")
 
 
 def _build_detector(args: argparse.Namespace, fixtures: Path) -> Detector | None:
@@ -223,10 +299,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lines-per-chunk", type=int, default=None)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["float32", "float16"], default="float32")
+    ap.add_argument("--perturb", action="store_true")
     args = ap.parse_args(argv)
     if not args.fixtures.exists():
         return run(args.fixtures)  # reports the missing file without loading a model
-    return run(args.fixtures, _build_detector(args, args.fixtures))
+    return run(args.fixtures, _build_detector(args, args.fixtures), args.perturb)
 
 
 if __name__ == "__main__":
