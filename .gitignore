@@ -44,4 +44,4 @@ captures/
 # commit only the *.example templates, keep the working copies local.
 safe_share.toml
 fixtures/detect/cases.json
-fixtures/manual/test_page.html
+fixtures/manual/

@@ -36,9 +36,10 @@ _SIG_DIFF_THRESH = 4.0
 _MAX_SKIP_FRAMES = 15
 
 # Watchdog: while live, if nothing has reached the screen for this long (an OCR
-# hang, or capture silently stalling), fall to neutral. Placeholder values; set
-# them from a measured process() p95 on a real capture run.
-_WATCHDOG_TIMEOUT = 2.0
+# hang, or capture silently stalling), fall to neutral. Measured frame total (OCR +
+# GLiNER + mask) on the test screens: p95 0.32 s, max 0.44 s; dense real screens
+# have tripped 2.0 s before.
+_WATCHDOG_TIMEOUT = 3.0
 _WATCHDOG_POLL = 0.25
 # The first frame after start/resume gets a wider budget: a cold Vision request
 # (model warm-up) can take several seconds without anything being wrong.
@@ -198,16 +199,21 @@ class FramePipeline:
         self.republished = 0
         self.failed = 0
         self.watchdog_fired = 0
-        # (ocr_ms, detect_ms) per processed frame, bounded.
-        self._timings: deque[tuple[float, float]] = deque(maxlen=5000)
+        # (ocr_ms, detect_ms, total_ms) per processed frame, bounded.
+        self._timings: deque[tuple[float, float, float]] = deque(maxlen=5000)
 
     def timing_summary(self) -> str:
-        """OCR and detection time of processed frames: p50/p95/max in ms."""
+        """Frame counters, then OCR, detection and OCR-to-mask total per processed
+        frame: p50/p95/max in ms."""
+        counts = (
+            f"[timing] published={self.published} republished={self.republished}"
+            f" failed={self.failed} watchdog_fired={self.watchdog_fired}"
+        )
         if not self._timings:
-            return "[timing] no processed frames"
+            return f"{counts} | no processed frames"
         snap = list(self._timings)  # atomic copy; the worker may still append
-        parts = [f"[timing] processed={len(snap)}"]
-        for name, i in (("ocr", 0), ("detect", 1)):
+        parts = [counts, f"processed={len(snap)}"]
+        for name, i in (("ocr", 0), ("detect", 1), ("total", 2)):
             ms = sorted(t[i] for t in snap)
             p95 = ms[min(len(ms) - 1, int(0.95 * len(ms)))]
             parts.append(
@@ -379,7 +385,8 @@ class FramePipeline:
             detections = self._detector.detect([ln.text for ln in lines])
             t2 = time.perf_counter()
             masked = redact(frame, lines, detections)
-            self._timings.append(((t1 - t0) * 1000, (t2 - t1) * 1000))
+            t3 = time.perf_counter()
+            self._timings.append(((t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t0) * 1000))
         except Exception as exc:  # noqa: BLE001 - any failure must go neutral
             # A failed run is not "no sensitive text". The exception message can
             # carry recognized text, so only its type is reported.

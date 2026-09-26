@@ -9,7 +9,6 @@ Run:  python -m safe_share.spike   (needs Screen Recording permission)
 
 from __future__ import annotations
 
-import atexit
 import signal
 import sys
 import threading
@@ -36,7 +35,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
 )
 from Foundation import NSData, NSObject
-from PyObjCTools import AppHelper
+from PyObjCTools import AppHelper, MachSignals
 from Quartz import CATransaction
 
 from .capture import CaptureError, DisplayCapture
@@ -260,6 +259,9 @@ class SafeShareSpike:
             self._pipeline.shutdown()
         if self._capture is not None:
             self._capture.stop()
+        if self._pipeline is not None:
+            # Here, not atexit: terminate_ calls C exit(), which skips Python's atexit.
+            print(self._pipeline.timing_summary(), flush=True)
         AppHelper.stopEventLoop()
 
     def _build_windows(self) -> LayerPresenter:
@@ -420,8 +422,6 @@ class SafeShareSpike:
             on_session_stopped=self._on_session_stopped,
         )
         self._pipeline = pipeline
-        # Quit ends in NSApp.terminate_ (exit), so code after the event loop never runs.
-        atexit.register(lambda: print(pipeline.timing_summary()))
         self._worker = threading.Thread(target=pipeline.run, daemon=True)
         self._worker.start()
 
@@ -436,11 +436,12 @@ class SafeShareSpike:
             )
         )
 
-        # installInterrupt handles SIGINT (Ctrl-C); add SIGTERM so `kill` also
-        # stops the stream before exit rather than dropping to default terminate.
-        signal.signal(signal.SIGTERM, lambda *_: self.request_quit())
+        # Mach signals run on the event loop; a plain signal.signal handler would
+        # wait for Python code to run. Ctrl-C and `kill` take the Quit path.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            MachSignals.signal(sig, lambda _: self.request_quit())
 
-        AppHelper.runEventLoop(installInterrupt=True)
+        AppHelper.runEventLoop(installInterrupt=False)
         return 0
 
 
