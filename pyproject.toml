@@ -11,6 +11,7 @@ dependencies = [
     "numpy>=2.5.3",
     "pillow>=12.3.0",
     "pyobjc-framework-cocoa>=12.2.2",
+    "pyobjc-framework-coretext>=12.2.2",
     "pyobjc-framework-libdispatch>=12.2.2",
     "pyobjc-framework-quartz>=12.2.2",
     "pyobjc-framework-screencapturekit>=12.2.2",

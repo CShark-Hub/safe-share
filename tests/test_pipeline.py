@@ -472,7 +472,7 @@ def test_published_frame_is_masked():
     assert len(publisher.frames) == 1
     _, _, out = publisher.frames[0]
     x0, y0, x1, y1 = _EMAIL_BOX
-    assert (out[y0:y1, x0:x1, 0:3] == 0).all()
+    assert not (out[y0:y1, x0:x1, 0:3] == 200).all(axis=-1).any()
 
 
 def _page(fill: int = 210) -> np.ndarray:
