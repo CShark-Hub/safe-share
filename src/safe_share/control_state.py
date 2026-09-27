@@ -7,38 +7,45 @@ never resumes) and a dead session is visible rather than silent.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 
 class ControlState(Enum):
+    STARTING = "starting"  # live, no frame published yet
     RUNNING = "running"
     PAUSED = "paused"
     STOPPED = "stopped"  # terminal: only restarting the process continues
 
 
-def control_state(live: bool, stopped: bool) -> ControlState:
+def control_state(live: bool, stopped: bool, started: bool = True) -> ControlState:
     if stopped:
         return ControlState.STOPPED
-    return ControlState.RUNNING if live else ControlState.PAUSED
+    if not live:
+        return ControlState.PAUSED
+    return ControlState.RUNNING if started else ControlState.STARTING
 
 
-_ENABLED: dict[ControlState, dict[str, bool]] = {
-    ControlState.RUNNING: {"pause": True, "resume": False, "stop": True},
-    ControlState.PAUSED: {"pause": False, "resume": True, "stop": True},
-    ControlState.STOPPED: {"pause": False, "resume": False, "stop": False},
-}
-
-_STATUS: dict[ControlState, str] = {
-    ControlState.RUNNING: "Protecting",
-    ControlState.PAUSED: "Paused — output hidden",
-    ControlState.STOPPED: "Stopped — quit and relaunch to protect again",
-}
+@dataclass(frozen=True)
+class ControlView:
+    status: str
+    dot: str  # "green" | "orange" | "red" | "gray"
+    toggle_title: str
+    toggle_enabled: bool
+    stop_enabled: bool
 
 
-def button_enablement(state: ControlState) -> dict[str, bool]:
-    """Enabled flag per control button (Quit is always enabled, so omitted)."""
-    return _ENABLED[state]
-
-
-def status_text(state: ControlState) -> str:
-    return _STATUS[state]
+def control_view(state: ControlState, names_off: bool = False) -> ControlView:
+    """Status line and button states for the controls window (Quit is always on)."""
+    if state is ControlState.STARTING:
+        return ControlView("Starting protection…", "gray", "Pause", True, True)
+    if state is ControlState.RUNNING:
+        status = "Protecting your screen" + (" (names off)" if names_off else "")
+        return ControlView(status, "green", "Pause", True, True)
+    if state is ControlState.PAUSED:
+        return ControlView(
+            "Paused · viewers see a hidden screen", "orange", "Resume", True, True
+        )
+    return ControlView(
+        "Stopped · relaunch to share again", "red", "Resume", False, False
+    )

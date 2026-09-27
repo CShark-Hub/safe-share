@@ -22,7 +22,19 @@ from AppKit import (
     NSApplicationActivationPolicyRegular,
     NSBackingStoreBuffered,
     NSButton,
+    NSColor,
+    NSEdgeInsets,
+    NSEventModifierFlagCommand,
+    NSFont,
+    NSFontAttributeName,
+    NSFontWeightSemibold,
+    NSForegroundColorAttributeName,
+    NSLayoutAttributeLeading,
+    NSMakePoint,
     NSMakeRect,
+    NSMaxX,
+    NSMaxY,
+    NSMutableAttributedString,
     NSStackView,
     NSTextField,
     NSTimer,
@@ -41,12 +53,19 @@ from Quartz import CATransaction
 from .capture import CaptureError, DisplayCapture
 from .capture_errors import StopDisposition
 from .config import load_config
-from .control_state import button_enablement, control_state, status_text
+from .control_state import control_state, control_view
 from .detect import Detector, RuleConfig, RuleDetector, UnionDetector
 from .ocr import TextRecognizer
 from .pipeline import FramePipeline, SessionState
 
 _NEUTRAL_RGBA = (0.10, 0.10, 0.10, 1.0)
+_STATUS_MIN_WIDTH = 300
+_DOT_COLORS = {
+    "green": NSColor.systemGreenColor,
+    "orange": NSColor.systemOrangeColor,
+    "red": NSColor.systemRedColor,
+    "gray": NSColor.systemGrayColor,
+}
 
 
 def should_deliver(accepted: bool, seq: int, last_seq: int) -> bool:
@@ -151,11 +170,8 @@ class Controls(NSObject):
         self._app = app
         return self
 
-    def pauseClicked_(self, sender):
-        self._app.request_pause()
-
-    def resumeClicked_(self, sender):
-        self._app.request_resume()
+    def toggleClicked_(self, sender):
+        self._app.request_toggle()
 
     def stopClicked_(self, sender):
         self._app.request_stop()
@@ -178,10 +194,12 @@ class SafeShareSpike:
         self._controls_window = None
         self._buttons: dict[str, object] = {}
         self._status_label = None
+        self._shown_view = None
         self._refresh_timer = None
         self._capture: DisplayCapture | None = None
         self._rule_config = RuleConfig()
         self._detector_note = "rules only"
+        self._names_off = False
         self._state = SessionState()
         self._pipeline: FramePipeline | None = None
         self._worker: threading.Thread | None = None
@@ -220,6 +238,15 @@ class SafeShareSpike:
         if self._capture is not None:
             self._capture.stop()
         self._refresh_controls()
+
+    def request_toggle(self) -> None:
+        live, stopped = self._state.snapshot()
+        if stopped:
+            self._refresh_controls()
+        elif live:
+            self.request_pause()
+        else:
+            self.request_resume()
 
     def request_pause(self) -> None:
         print("[controls] pause")
@@ -300,13 +327,17 @@ class SafeShareSpike:
         self._controls_window.setReleasedWhenClosed_(False)
 
         self._controls_target = Controls.alloc().initWithApp_(self)
+        toggle = NSButton.buttonWithTitle_target_action_(
+            "Resume", self._controls_target, b"toggleClicked:"
+        )
+        # Fixed at the wider title so Stop/Quit do not shift on each toggle.
+        toggle.widthAnchor().constraintEqualToConstant_(
+            toggle.fittingSize().width
+        ).setActive_(True)
+        toggle.setKeyEquivalent_("p")
+        toggle.setKeyEquivalentModifierMask_(NSEventModifierFlagCommand)
         self._buttons = {
-            "pause": NSButton.buttonWithTitle_target_action_(
-                "Pause", self._controls_target, b"pauseClicked:"
-            ),
-            "resume": NSButton.buttonWithTitle_target_action_(
-                "Resume", self._controls_target, b"resumeClicked:"
-            ),
+            "toggle": toggle,
             "stop": NSButton.buttonWithTitle_target_action_(
                 "Stop", self._controls_target, b"stopClicked:"
             ),
@@ -315,22 +346,29 @@ class SafeShareSpike:
             "Quit", self._controls_target, b"quitClicked:"
         )
         button_row = NSStackView.stackViewWithViews_(
-            [
-                self._buttons["pause"],
-                self._buttons["resume"],
-                self._buttons["stop"],
-                quit_,
-            ]
+            [self._buttons["toggle"], self._buttons["stop"], quit_]
         )
         button_row.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal)
         button_row.setSpacing_(8)
 
         self._status_label = NSTextField.labelWithString_("")
+        self._status_label.widthAnchor().constraintGreaterThanOrEqualToConstant_(
+            _STATUS_MIN_WIDTH
+        ).setActive_(True)
         column = NSStackView.stackViewWithViews_([self._status_label, button_row])
         column.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
-        column.setSpacing_(8)
+        column.setAlignment_(NSLayoutAttributeLeading)
+        column.setSpacing_(12)
+        column.setEdgeInsets_(NSEdgeInsets(20, 20, 20, 20))
+        self._controls_window.setContentSize_(column.fittingSize())
         column.setFrame_(self._controls_window.contentView().bounds())
         self._controls_window.contentView().addSubview_(column)
+        out = self._output_window.frame()
+        x = NSMaxX(out) + 16
+        screen = self._output_window.screen()
+        if screen is not None:
+            x = min(x, NSMaxX(screen.visibleFrame()) - column.fittingSize().width)
+        self._controls_window.setFrameTopLeftPoint_(NSMakePoint(x, NSMaxY(out)))
 
         self._output_window.makeKeyAndOrderFront_(None)
         self._controls_window.orderFront_(None)
@@ -342,14 +380,27 @@ class SafeShareSpike:
         only; a repeating timer also runs it so a background stop (watchdog,
         capture error) updates the UI without a per-path hop."""
         live, stopped = self._state.snapshot()
-        state = control_state(live, stopped)
-        enabled = button_enablement(state)
-        for name, button in self._buttons.items():
-            button.setEnabled_(enabled[name])
-        if self._status_label is not None:
-            self._status_label.setStringValue_(
-                f"{status_text(state)} · {self._detector_note}"
-            )
+        started = self._pipeline is not None and self._pipeline.published > 0
+        view = control_view(control_state(live, stopped, started), self._names_off)
+        if view == self._shown_view or self._status_label is None:
+            return
+        self._shown_view = view
+        self._buttons["toggle"].setTitle_(view.toggle_title)
+        self._buttons["toggle"].setEnabled_(view.toggle_enabled)
+        self._buttons["stop"].setEnabled_(view.stop_enabled)
+        font = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+        text = NSMutableAttributedString.alloc().initWithString_attributes_(
+            f"● {view.status}",
+            {
+                NSFontAttributeName: font,
+                NSForegroundColorAttributeName: NSColor.labelColor(),
+            },
+        )
+        text.addAttribute_value_range_(
+            NSForegroundColorAttributeName, _DOT_COLORS[view.dot](), (0, 1)
+        )
+        self._status_label.setAttributedStringValue_(text)
+        self._status_label.setToolTip_(f"Detection: {self._detector_note}")
 
     def _build_detector(self, use_gliner: bool) -> Detector:
         """Rules, plus GLiNER when enabled and loadable; never downloads."""
@@ -363,9 +414,11 @@ class SafeShareSpike:
             model, where = load_best()
         except ImportError:
             print("[detect] GLiNER not installed (uv sync --extra ml); rules only")
+            self._names_off = True
             return rules
         except ModelUnavailable as exc:
             print(f"[detect] GLiNER unavailable ({exc}); rules only")
+            self._names_off = True
             return rules
         print(
             f"[detect] rules + GLiNER on {where}, loaded in {time.monotonic() - t:.1f}s"
@@ -400,6 +453,7 @@ class SafeShareSpike:
         )
         # Before capture starts, so the load stays outside the watchdog budget.
         detector = self._build_detector(config.gliner)
+        self._shown_view = None  # the tooltip carries the detector note
 
         self._capture = DisplayCapture(self._on_frame, self._on_stop)
         try:
