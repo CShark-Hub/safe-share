@@ -8,8 +8,10 @@ Invariants:
   - pause, resume and stop bump the epoch; a frame stamped with an older epoch
     is dropped, and the skip cache resets when the epoch changes
   - any OCR/detect/render failure publishes neutral, never a raw frame
-  - if output stalls while live (a hang or silent capture stall), a watchdog
-    thread stops the session and publishes neutral
+  - if a pending or in-progress frame does not finish in time while live, a
+    watchdog thread stops the session and publishes neutral; input silence is
+    not a stall (SCK goes quiet on a static screen)
+  - an unreadable Complete frame is a failed run: neutral
 """
 
 from __future__ import annotations
@@ -35,8 +37,8 @@ _SIG_DIFF_THRESH = 4.0
 # output indefinitely while the real screen moves on.
 _MAX_SKIP_FRAMES = 15
 
-# Watchdog: while live, if nothing has reached the screen for this long (an OCR
-# hang, or capture silently stalling), fall to neutral. Measured frame total (OCR +
+# Watchdog: while live, if a pending or taken frame has not finished for this long
+# (an OCR/GLiNER hang), fall to neutral. Measured frame total (OCR +
 # GLiNER + mask) on the test screens: p95 0.32 s, max 0.44 s; dense real screens
 # have tripped 2.0 s before.
 _WATCHDOG_TIMEOUT = 3.0
@@ -173,7 +175,13 @@ class FramePipeline:
         self._monotonic = monotonic
 
         self._slot_lock = threading.Lock()
-        self._pending: tuple[np.ndarray, int, int] | None = None
+        # frame is None for a frame capture lost: processed as a failed run.
+        self._pending: tuple[np.ndarray | None, int, int] | None = None
+        self._busy = False  # a taken frame is being processed; under _slot_lock
+        # Capture callbacks (frames, lost markers, heartbeats); under _slot_lock.
+        self._last_input: float | None = None
+        self._max_input_gap = 0.0
+        self.heartbeats = 0
         self._seq = 0
         self._ready = threading.Event()
         self._shutdown = threading.Event()
@@ -184,9 +192,10 @@ class FramePipeline:
         self._last_epoch: int | None = None
         self._skips = 0  # consecutive republishes, capped by _MAX_SKIP_FRAMES
 
-        # Time of the last output that reached the screen; the watchdog measures
-        # the gap since. `_first_frame` widens the budget until the first publish
-        # after a live edge. Both guarded by _progress_lock (worker + watchdog).
+        # Time of the last output, or of the last tick with no work outstanding;
+        # the watchdog measures the gap since. `_first_frame` widens the budget
+        # until the first publish after a live edge. Both guarded by
+        # _progress_lock (worker + watchdog).
         self._progress_lock = threading.Lock()
         self._last_progress = self._monotonic()
         self._first_frame = True
@@ -198,6 +207,7 @@ class FramePipeline:
         self.published = 0
         self.republished = 0
         self.failed = 0
+        self.lost_frames = 0
         self.watchdog_fired = 0
         # (ocr_ms, detect_ms, total_ms) per processed frame, bounded.
         self._timings: deque[tuple[float, float, float]] = deque(maxlen=5000)
@@ -208,6 +218,8 @@ class FramePipeline:
         counts = (
             f"[timing] published={self.published} republished={self.republished}"
             f" failed={self.failed} watchdog_fired={self.watchdog_fired}"
+            f" lost={self.lost_frames} heartbeats={self.heartbeats}"
+            f" max_input_gap={self._max_input_gap:.1f}s"
         )
         if not self._timings:
             return f"{counts} | no processed frames"
@@ -227,14 +239,24 @@ class FramePipeline:
         The epoch is stamped here, not at processing time: what decides whether
         a frame may be shown is the state it was *captured* under.
         """
+        return self._put(frame)
+
+    def lost(self) -> None:
+        """Capture could not read a Complete frame: the output no longer matches
+        the screen, so it goes neutral in order with the frames around it."""
+        self._put(None)
+
+    def _put(self, frame: np.ndarray | None) -> int:
         epoch = self._state.epoch
         with self._slot_lock:
+            self._note_input()
             if self._pending is not None:
                 self.dropped_stale += 1
             self._seq += 1
             self._pending = (frame, self._seq, epoch)
+            seq = self._seq
         self._ready.set()
-        return self._seq
+        return seq
 
     def invalidate(self) -> None:
         """Discard the pending frame. The epoch stamp is what gates publication;
@@ -252,10 +274,36 @@ class FramePipeline:
         with self._slot_lock:
             return None if self._pending is None else self._pending[1]
 
-    def _take(self) -> tuple[np.ndarray, int, int] | None:
+    def heartbeat(self) -> None:
+        """Capture reports an unchanged screen; counted for diagnostics only."""
+        with self._slot_lock:
+            self._note_input()
+            self.heartbeats += 1
+
+    def _note_input(self) -> None:
+        now = self._monotonic()
+        if self._last_input is not None:
+            self._max_input_gap = max(self._max_input_gap, now - self._last_input)
+        self._last_input = now
+
+    def stall_report(self) -> str:
+        """Counts-only state for a watchdog log line."""
+        with self._slot_lock:
+            ago = (
+                "none"
+                if self._last_input is None
+                else f"{self._monotonic() - self._last_input:.1f}s ago"
+            )
+            return (
+                f"last capture callback {ago}, pending={self._pending is not None}, "
+                f"busy={self._busy}"
+            )
+
+    def _take(self) -> tuple[np.ndarray | None, int, int] | None:
         with self._slot_lock:
             pending = self._pending
             self._pending = None
+            self._busy = pending is not None
             return pending
 
     def _mark_progress(self, now: float | None = None) -> None:
@@ -279,7 +327,11 @@ class FramePipeline:
                 self._last_progress = now
                 self._first_frame = True
             return True
+        with self._slot_lock:
+            outstanding = self._pending is not None or self._busy
         with self._progress_lock:
+            if not outstanding:
+                self._last_progress = now  # the clock runs only while work waits
             gap = now - self._last_progress
             budget = (
                 self._watchdog_first_frame
@@ -324,7 +376,11 @@ class FramePipeline:
                 pending = self._take()
                 if pending is None:
                     continue
-                self.process(*pending)
+                try:
+                    self.process(*pending)
+                finally:
+                    with self._slot_lock:
+                        self._busy = False
         except BaseException as exc:  # noqa: BLE001 - a dead worker must go neutral
             # The worker dying silently would leave the last sanitized frame on
             # screen while the real screen moves on. Stop first so the neutral
@@ -348,7 +404,7 @@ class FramePipeline:
             self._shutdown.set()
             watchdog.join(timeout=1.0)
 
-    def process(self, frame: np.ndarray, seq: int, epoch: int) -> None:
+    def process(self, frame: np.ndarray | None, seq: int, epoch: int) -> None:
         """Run one captured frame end to end. `epoch` is its capture-time stamp."""
         if not self._state.accepts(epoch):
             # Captured under a state that no longer permits publication, so it
@@ -363,6 +419,15 @@ class FramePipeline:
             self._last_masked = None
             self._last_epoch = epoch
             self._skips = 0
+
+        if frame is None:
+            self.lost_frames += 1
+            self._last_sig = None
+            self._last_masked = None
+            self._publisher.publish_neutral(epoch)
+            if self._on_error is not None:
+                self._on_error("lost")
+            return
 
         sig = frame_signature(frame)
         last_masked = self._last_masked

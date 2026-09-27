@@ -279,6 +279,7 @@ def test_watchdog_fires_neutral_and_stops_when_output_stalls():
         monotonic=clock,
     )
     state.go_live()
+    pipeline.submit(_frame())  # waits, never processed
 
     live = pipeline._watchdog_tick(False)  # live edge: baseline at t=0
     assert live is True
@@ -325,6 +326,7 @@ def test_watchdog_gives_the_first_frame_a_wider_budget():
         monotonic=clock,
     )
     state.go_live()
+    pipeline.submit(_frame())  # waits, never processed
 
     pipeline._watchdog_tick(False)  # baseline, first-frame budget armed
     clock.t = 5.0  # past the 2s steady timeout, under the 10s first-frame grace
@@ -346,6 +348,7 @@ def test_watchdog_fire_notifies_session_stopped():
         on_session_stopped=lambda: stopped_calls.append(True),
     )
     state.go_live()
+    pipeline.submit(_frame())  # waits, never processed
     pipeline._watchdog_tick(False)
     clock.t = 3.0
     pipeline._watchdog_tick(True)
@@ -376,9 +379,28 @@ def test_watchdog_narrows_to_steady_timeout_after_first_publish():
     state.go_live()
     pipeline._watchdog_tick(False)  # live edge: first-frame budget armed
     pipeline.process(_frame(), 1, state.epoch)  # publishes, ends the grace
+    pipeline.submit(_frame())  # waits, never processed
 
     clock.t = 3.0  # past the 2s steady timeout, under the 10s first-frame grace
     assert pipeline._watchdog_tick(True) is False  # steady budget now applies
+    assert pipeline.watchdog_fired == 1
+    assert publisher.neutrals != []
+
+
+@pytest.mark.parametrize("stuck", ["pending", "in_progress"])
+def test_stuck_frame_fires_without_any_input(stuck):
+    clock = FakeClock()
+    pipeline, publisher, state = _pipeline(
+        FakeRecognizer(), watchdog_timeout=2.0, monotonic=clock
+    )
+    state.go_live()
+    pipeline._watchdog_tick(False)
+    pipeline.process(_frame(), 1, state.epoch)
+    pipeline.submit(_frame())
+    if stuck == "in_progress":
+        assert pipeline._take() is not None  # taken, never finished
+    clock.t = 3.0
+    assert pipeline._watchdog_tick(True) is False
     assert pipeline.watchdog_fired == 1
     assert publisher.neutrals != []
 
@@ -576,3 +598,33 @@ def test_should_deliver(accepted, seq, last_seq, expected):
     from safe_share.spike import should_deliver
 
     assert should_deliver(accepted, seq, last_seq) is expected
+
+
+def test_lost_frame_goes_neutral_and_clears_the_cache():
+    recognizer = FakeRecognizer()
+    pipeline, publisher, state = _pipeline(recognizer)
+    state.go_live()
+    pipeline.process(_frame(), 1, state.epoch)
+    pipeline.process(None, 2, state.epoch)
+    assert publisher.neutrals == [state.epoch]
+    pipeline.process(_frame(), 3, state.epoch)  # same pixels, but re-OCR'd
+    assert recognizer.calls == 2
+    assert pipeline.republished == 0
+
+
+def test_lost_frame_while_paused_publishes_nothing():
+    pipeline, publisher, state = _pipeline(FakeRecognizer())
+    state.go_live()
+    epoch = state.epoch
+    state.pause()
+    pipeline.process(None, 1, epoch)
+    assert publisher.neutrals == [] and publisher.frames == []
+
+
+def test_a_newer_frame_replaces_a_lost_marker():
+    pipeline, _, state = _pipeline(FakeRecognizer())
+    state.go_live()
+    pipeline.lost()
+    seq = pipeline.submit(_frame())
+    taken = pipeline._take()
+    assert taken is not None and taken[0] is not None and taken[1] == seq

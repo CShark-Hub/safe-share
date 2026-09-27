@@ -278,6 +278,14 @@ class SafeShareSpike:
         if self._pipeline is not None:
             self._pipeline.submit(frame)
 
+    def _on_idle(self) -> None:
+        if self._pipeline is not None:
+            self._pipeline.heartbeat()
+
+    def _on_lost(self) -> None:
+        if self._pipeline is not None:
+            self._pipeline.lost()
+
     def _on_stop(self, disposition: StopDisposition, message: str) -> None:
         # Every disposition ends the session with neutral output; the class only
         # informs the log (a future rebuild path can branch on RECOVERABLE).
@@ -293,9 +301,13 @@ class SafeShareSpike:
 
     def _on_pipeline_error(self, reason: str) -> None:
         if reason == "watchdog":
+            note = self._pipeline.stall_report() if self._pipeline is not None else ""
             print(
-                "[pipeline] watchdog fired: output stalled → neutral", file=sys.stderr
+                f"[pipeline] watchdog fired: output stalled → neutral ({note})",
+                file=sys.stderr,
             )
+        elif reason == "lost":
+            print("[pipeline] capture lost a frame → neutral", file=sys.stderr)
         else:
             print(f"[pipeline] frame failed: {reason}", file=sys.stderr)
 
@@ -525,7 +537,12 @@ class SafeShareSpike:
         detector = self._build_detector(config.gliner)
         self._shown_view = None  # the tooltip carries the detector note
 
-        self._capture = DisplayCapture(self._on_frame, self._on_stop)
+        self._capture = DisplayCapture(
+            self._on_frame,
+            self._on_stop,
+            idle_handler=self._on_idle,
+            lost_handler=self._on_lost,
+        )
         try:
             self._capture.build()
         except CaptureError as exc:
