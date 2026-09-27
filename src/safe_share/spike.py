@@ -20,15 +20,22 @@ import Quartz
 from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyRegular,
+    NSAttributedString,
     NSBackingStoreBuffered,
+    NSBezierPath,
     NSButton,
     NSColor,
     NSEdgeInsets,
     NSEventModifierFlagCommand,
     NSFont,
     NSFontAttributeName,
+    NSFontWeightMedium,
+    NSFontWeightRegular,
     NSFontWeightSemibold,
     NSForegroundColorAttributeName,
+    NSGraphicsContext,
+    NSImage,
+    NSImageSymbolConfiguration,
     NSLayoutAttributeLeading,
     NSMakePoint,
     NSMakeRect,
@@ -59,6 +66,7 @@ from .ocr import TextRecognizer
 from .pipeline import FramePipeline, SessionState
 
 _NEUTRAL_RGBA = (0.10, 0.10, 0.10, 1.0)
+_CARD_SIZE = (1920, 1200)
 _STATUS_MIN_WIDTH = 300
 _DOT_COLORS = {
     "green": NSColor.systemGreenColor,
@@ -104,6 +112,62 @@ def _cgimage_from_bgra(arr: np.ndarray):
     return cg
 
 
+def _neutral_card():
+    """The static screen shown whenever output is withheld; identical in every state.
+
+    Drawn with AppKit into a bitmap context; main thread only.
+    """
+    w, h = _CARD_SIZE
+    cs = Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB)
+    ctx = Quartz.CGBitmapContextCreate(
+        None,
+        w,
+        h,
+        8,
+        0,
+        cs,
+        Quartz.kCGBitmapByteOrder32Little | Quartz.kCGImageAlphaPremultipliedFirst,
+    )
+    NSGraphicsContext.saveGraphicsState()
+    try:
+        NSGraphicsContext.setCurrentContext_(
+            NSGraphicsContext.graphicsContextWithCGContext_flipped_(ctx, False)
+        )
+        NSColor.colorWithSRGBRed_green_blue_alpha_(*_NEUTRAL_RGBA).setFill()
+        NSBezierPath.fillRect_(NSMakeRect(0, 0, w, h))
+        cx, cy = w / 2, h / 2  # origin bottom-left
+
+        config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+            96, NSFontWeightMedium
+        ).configurationByApplyingConfiguration_(
+            NSImageSymbolConfiguration.configurationWithHierarchicalColor_(
+                NSColor.systemGrayColor()
+            )
+        )
+        lock = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "lock.fill", None
+        )
+        if lock is not None:
+            lock = lock.imageWithSymbolConfiguration_(config)
+            lw, lh = lock.size().width, lock.size().height
+            lock.drawInRect_(NSMakeRect(cx - lw / 2, cy + 70, lw, lh))
+
+        _draw_centered("Safe Share", NSFontWeightSemibold, 64, 0.90, cx, cy - 10)
+        _draw_centered("Screen hidden", NSFontWeightRegular, 36, 0.56, cx, cy - 80)
+    finally:
+        NSGraphicsContext.restoreGraphicsState()
+    return Quartz.CGBitmapContextCreateImage(ctx)
+
+
+def _draw_centered(text, weight, size, white, cx, baseline):
+    attrs = {
+        NSFontAttributeName: NSFont.systemFontOfSize_weight_(size, weight),
+        NSForegroundColorAttributeName: NSColor.colorWithWhite_alpha_(white, 1.0),
+    }
+    s = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+    s.drawAtPoint_(NSMakePoint(cx - s.size().width / 2, baseline))
+
+
 class LayerPresenter:
     """Publishes frames or the neutral screen to a CALayer.
 
@@ -117,6 +181,11 @@ class LayerPresenter:
         self._last_seq = 0
         self._cache_frame = None
         self._cache_cg = None
+        try:
+            self._card = _neutral_card()
+        except Exception as exc:  # noqa: BLE001 - cosmetic; plain colour is still neutral
+            print(f"[ui] neutral card failed: {exc}", file=sys.stderr)
+            self._card = None
         self.show_neutral()
 
     def publish(self, epoch: int, seq: int, frame: np.ndarray) -> None:
@@ -155,8 +224,9 @@ class LayerPresenter:
         r, g, b, a = _NEUTRAL_RGBA
         CATransaction.begin()
         CATransaction.setDisableActions_(True)
-        self._layer.setContents_(None)
-        self._layer.setBackgroundColor_(Quartz.CGColorCreateGenericRGB(r, g, b, a))
+        self._layer.setContents_(self._card)
+        # Same colour as the card, so aspect-fit letterboxing is invisible.
+        self._layer.setBackgroundColor_(Quartz.CGColorCreateSRGB(r, g, b, a))
         CATransaction.commit()
         self._cache_frame = None
         self._cache_cg = None
