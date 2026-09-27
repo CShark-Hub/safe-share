@@ -47,13 +47,23 @@ class Detector(Protocol):
 
 
 class UnionDetector:
-    """Runs every detector; a span flagged by any of them is kept."""
+    """Runs every detector; drops a model span inside a rule span on the same line."""
 
     def __init__(self, *detectors: Detector) -> None:
         self._detectors = detectors
 
     def detect(self, texts: list[str]) -> list[Detection]:
-        return [d for det in self._detectors for d in det.detect(texts)]
+        found = [d for det in self._detectors for d in det.detect(texts)]
+        rules = [d for d in found if d.source == "rule"]
+        return [
+            d
+            for d in found
+            if d.source == "rule"
+            or not any(
+                r.line_index == d.line_index and r.start <= d.start and d.end <= r.end
+                for r in rules
+            )
+        ]
 
 
 @dataclass
@@ -108,6 +118,9 @@ _KEY_SHAPES: list[tuple[str, re.Pattern[str]]] = [
         ),
     ),
 ]
+CREDENTIAL_TYPES = frozenset(
+    [name for name, _ in _KEY_SHAPES] + ["pem_key", "keyed_secret", "conn_password"]
+)
 
 _KEYWORDS = (
     "password",

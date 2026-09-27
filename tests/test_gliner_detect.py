@@ -137,6 +137,26 @@ def test_union_keeps_hits_from_every_detector_and_propagates_failures() -> None:
         UnionDetector(RuleDetector(RuleConfig(terms=[])), Broken()).detect(texts)
 
 
+def test_union_drops_only_model_spans_inside_rule_spans() -> None:
+    texts = ["Kestrel Bank renewal", "mail kestrel@example.com", "ask Kestrel Bank Ltd"]
+    union = UnionDetector(
+        RuleDetector(RuleConfig(terms=["Kestrel Bank"])),
+        GlinerDetector(
+            FakeModel(
+                {"Kestrel Bank": "person", "kestrel": "person", "Bank Ltd": "person"}
+            )
+        ),
+    )
+    found = union.detect(texts)
+    assert {d.line_index for d in found} == {0, 1, 2}  # no line loses coverage
+    assert _spans(found, texts) == {
+        (0, "Kestrel Bank", "term"),
+        (1, "kestrel@example.com", "email"),
+        (2, "Kestrel Bank", "term"),
+        (2, "Bank Ltd", "person"),  # partial overlap: both kept
+    }
+
+
 def _model_cached() -> bool:
     # Must not import huggingface_hub: it reads HF_HUB_OFFLINE at import time.
     if importlib.util.find_spec("gliner") is None:
