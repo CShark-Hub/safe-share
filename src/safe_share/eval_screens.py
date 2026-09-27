@@ -4,8 +4,13 @@
 `screens_credentials.json`. A truth string readable after masking is a leak, by
 stage: detection (read, not flagged), mask (flagged, still readable), ocr (not
 read in pass 1). Vision-readable only: a lower bound on what a person can read.
-Misread truth is "garbled", never-read truth "unread". Masked harmless lines
-print their OCR text only with --show-text. Nothing is written to disk.
+Misread truth is "garbled", never-read truth "unread". "Collateral" counts
+unflagged harmless lines at least half under a pill. Masked harmless lines print
+their OCR text only with --show-text. Nothing is written to disk unless
+--save DIR is given: masked screenshots as <name>_masked.png, for visual review.
+They still show any leak the report lists; treat them like the input.
+--jitter re-runs each image shifted by 1-3 px and reports, as counts only, how
+often flagged lines are lost and how much pill grouping and label size change.
 Run: python -m safe_share.eval_screens [dir] [--detector rules|union] [--scale 0.5]
 """
 
@@ -27,14 +32,14 @@ from PIL import Image
 
 from .detect import Detector, RuleConfig, RuleDetector, UnionDetector
 from .ocr import TextRecognizer
-from .redact import redact
+from .redact import GRAPHITE, fit_label, label_for, label_px, plan, redact
 from .types import OcrLine
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SCREENS = _ROOT / "fixtures" / "screens"
 _TRUTH = _ROOT / "fixtures" / "detect" / "screens.json"
 _LOCAL_TRUTH = _ROOT / "fixtures" / "detect" / "screens_credentials.json"
-_NAME = re.compile(r"scene_(\d+)_(\w+)\.png")
+_NAME = re.compile(r"scene_(\d+)_(\w+)(?<!_masked)\.png")
 _FUZZY = 0.75
 _FUZZY_MIN_LEN = 5  # shorter names fuzzy-match ordinary words
 _WORD = re.compile(r"[^\W_]+")
@@ -53,8 +58,13 @@ class SceneResult:
     harmless_masked: list[tuple[int, tuple[int, int, int, int], str]] = field(
         default_factory=list
     )
+    collateral: int = 0
     ocr_ms: float = 0.0
     det_ms: float = 0.0
+    mask_ms: float = 0.0
+    pills: int = 0
+    wrong_label: int = 0  # label type matches no truth type of its lines
+    no_label: int = 0  # label omitted: did not fit
 
 
 class Truth:
@@ -146,6 +156,7 @@ def evaluate(
     ocr: TextRecognizer,
     detector: Detector,
     scale: float = 1.0,
+    save: Path | None = None,
 ) -> SceneResult:
     truth = Truth(case, terms)
     r = SceneResult(path.stem, case.get("tags", []))
@@ -161,6 +172,7 @@ def evaluate(
 
     keep = [_norm(k) for k in case.get("keep", [])]
     read: set[str] = set()
+    harmless: list[int] = []
     for i, ln in enumerate(raw):
         hits = truth.find(ln.text)
         for s, t in hits:
@@ -176,15 +188,116 @@ def evaluate(
             r.garbled.append((near, i in flagged))
             continue
         r.harmless += 1
+        harmless.append(i)
         if i in flagged:
             r.harmless_masked.append((i, ln.box, ln.text))
     r.unread = sorted({_text(case, e) for e in case["expect"]} - read)
 
+    h, w = frame.shape[:2]
+    pills = plan(raw, detections, w, h)
+    for i in harmless:
+        box = raw[i].box
+        area = _overlap(box, box)
+        if i in flagged or not area:
+            continue
+        if max((_overlap(box, p.rect) for p in pills), default=0) * 2 >= area:
+            r.collateral += 1
+    px = label_px(raw) if raw else 0
+    for p in pills:
+        r.pills += 1
+        r.no_label += fit_label(p, px, *GRAPHITE) is None
+        want = {label_for(t) for i in p.lines for _, t in truth.find(raw[i].text)}
+        r.wrong_label += bool(want) and p.label not in want
+
+    t3 = time.perf_counter()
     masked = redact(frame.copy(), raw, detections)
+    r.mask_ms = (time.perf_counter() - t3) * 1000
+    if save is not None:
+        # _NAME excludes the suffix, so the output is never read as a fixture.
+        Image.fromarray(masked[..., [2, 1, 0]]).save(save / f"{path.stem}_masked.png")
     for ln in ocr.recognize(masked):
         for s, t in truth.find(ln.text):
             r.leaks.append((s, t, _stage(ln.box, s, raw, flagged)))
     return r
+
+
+_SHIFTS = ((1, 0), (0, 1), (1, 1), (2, 3), (3, 2))
+
+
+@dataclass
+class Jitter:
+    runs: int = 0
+    affected: int = 0  # runs that lost at least one flagged line
+    flagged: int = 0  # flagged lines in the unshifted frames, summed over runs
+    lost_unflagged: int = 0  # line still read, no longer flagged
+    lost_split: int = 0  # no OCR line in the same place
+    comparable: int = 0  # runs with the same flagged lines
+    regrouped: int = 0
+    label_px: int = 0  # comparable runs whose frame label size changed
+    edges: list[int] = field(default_factory=list)
+
+
+def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    inter = _overlap(a, b)
+    union = _overlap(a, a) + _overlap(b, b) - inter
+    return inter / union if union else 0.0
+
+
+def jitter(
+    path: Path, ocr: TextRecognizer, detector: Detector, scale: float, j: Jitter
+) -> None:
+    """Compare detection and pill geometry of `path` against 1-3 px shifted copies."""
+    frame = _load(path, scale)
+    h, w = frame.shape[:2]
+    base = ocr.recognize(frame)
+    base_det = detector.detect([ln.text for ln in base])
+    base_flag = [base[i].box for i in sorted({d.line_index for d in base_det})]
+    base_pills = plan(base, base_det, w, h)
+    for dx, dy in _SHIFTS:
+        pad = np.pad(frame, ((dy, 0), (dx, 0), (0, 0)), mode="edge")[:h, :w]
+        lines = [
+            OcrLine(ln.text, (x0 - dx, y0 - dy, x1 - dx, y1 - dy), ln.confidence)
+            for ln in ocr.recognize(np.ascontiguousarray(pad))
+            for x0, y0, x1, y1 in [ln.box]
+        ]
+        det = detector.detect([ln.text for ln in lines])
+        flag = [lines[i].box for i in sorted({d.line_index for d in det})]
+        lost = [
+            b for b in base_flag if max((_iou(b, f) for f in flag), default=0) <= 0.5
+        ]
+        j.runs += 1
+        j.flagged += len(base_flag)
+        j.affected += bool(lost)
+        for b in lost:
+            read = any(_iou(b, ln.box) > 0.5 for ln in lines)
+            j.lost_unflagged += read
+            j.lost_split += not read
+        if lost or len(flag) != len(base_flag):
+            continue
+        j.comparable += 1
+        pills = plan(lines, det, w, h)
+        shape = sorted(len(p.covers) for p in pills)
+        j.regrouped += shape != sorted(len(p.covers) for p in base_pills)
+        j.label_px += label_px(lines) != label_px(base)
+        for p in pills:
+            q = max(base_pills, key=lambda q: _iou(p.rect, q.rect))
+            j.edges.append(max(abs(a - b) for a, b in zip(p.rect, q.rect, strict=True)))
+
+
+def print_jitter(j: Jitter) -> None:
+    lost = j.lost_unflagged + j.lost_split
+    print(
+        f"\njitter ({j.runs} runs, 1-3 px shifts): flagged lines lost "
+        f"{_pct(lost, j.flagged)} in {j.affected} runs "
+        f"({j.lost_unflagged} no longer flagged, {j.lost_split} OCR split differently)"
+    )
+    if j.comparable:
+        e = np.array(j.edges) if j.edges else np.zeros(1)
+        print(
+            f"  same flagged lines in {j.comparable} runs: grouping changed "
+            f"{j.regrouped}, label size changed {j.label_px}, pill edge moved "
+            f"p95 {np.percentile(e, 95):.0f} / max {e.max():.0f} px"
+        )
 
 
 def _ms(xs: list[float]) -> str:
@@ -253,9 +366,20 @@ def print_report(results: list[SceneResult], show_text: bool = False) -> None:
                 if show_text
                 else f"  - {r.name}: line {i} {box}"
             )
+    n = sum(r.collateral for r in results)
+    print(
+        f"collateral (unflagged harmless lines under a pill): "
+        f"{_pct(n, sum(r.harmless for r in results))}"
+    )
+    pills = sum(r.pills for r in results)
+    print(
+        f"labels: wrong type {_pct(sum(r.wrong_label for r in results), pills)}, "
+        f"omitted {_pct(sum(r.no_label for r in results), pills)}"
+    )
     print(
         f"\nOCR {_ms([r.ocr_ms for r in results])}; "
-        f"detection {_ms([r.det_ms for r in results])} "
+        f"detection {_ms([r.det_ms for r in results])}; "
+        f"redact {_ms([r.mask_ms for r in results])} "
         "(offline, per image, one pass; live latency comes from the app's timing)"
     )
 
@@ -283,9 +407,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print OCR text of masked harmless lines",
     )
+    ap.add_argument(
+        "--jitter",
+        action="store_true",
+        help="also re-run each image shifted by 1-3 px (stability counts)",
+    )
+    ap.add_argument(
+        "--save",
+        type=Path,
+        help="write masked screenshots here; they may still show leaked text",
+    )
     args = ap.parse_args(argv)
     if not 0 < args.scale <= 1:
         ap.error("--scale must be in (0, 1]")
+    if args.save is not None:
+        if not args.save.is_dir():
+            ap.error(f"--save: {args.save} is not a directory")
+        if args.save.resolve() == args.screens.resolve():
+            ap.error("--save must not be the screenshots directory")
 
     files = sorted(
         (int(m[1]), p.name, p)
@@ -312,10 +451,18 @@ def main(argv: list[str] | None = None) -> int:
         if not 1 <= n <= len(cases):
             print(f"skip {p.name}: no case {n}", file=sys.stderr)
             continue
-        results.append(evaluate(p, cases[n - 1], terms, ocr, detector, args.scale))
+        results.append(
+            evaluate(p, cases[n - 1], terms, ocr, detector, args.scale, args.save)
+        )
     if not results:
         return 2
     print_report(results, args.show_text)
+    if args.jitter:
+        j = Jitter()
+        for n, _, p in files:
+            if 1 <= n <= len(cases):
+                jitter(p, ocr, detector, args.scale, j)
+        print_jitter(j)
     # Garbled truth left unmasked also fails.
     visible = any(r.leaks or any(not m for _, m in r.garbled) for r in results)
     return 1 if visible else 0
