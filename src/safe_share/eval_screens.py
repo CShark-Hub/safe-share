@@ -13,6 +13,8 @@ They still show any leak the report lists; treat them like the input.
 often flagged lines are lost and how much pill grouping and label size change.
 --context shifts the OCR lines on one side of a random vertical cut, as if a pane
 scrolled, and counts truth occurrences flagged in all, some or none of the runs.
+--name-cache image|session wraps the detector in the session name cache, fresh per
+image or one for the whole run; --context always uses a fresh cache per image.
 Run: python -m safe_share.eval_screens [dir] [--detector rules|union] [--scale 0.5]
 """
 
@@ -33,6 +35,7 @@ import numpy as np
 from PIL import Image
 
 from .detect import Detector, RuleConfig, RuleDetector, UnionDetector
+from .name_cache import NameCacheDetector
 from .ocr import TextRecognizer
 from .redact import GRAPHITE, fit_label, label_for, label_px, plan, redact
 from .types import OcrLine
@@ -297,6 +300,8 @@ _CONTEXT_MAX_SHIFT = 6  # line heights
 @dataclass
 class Context:
     runs: int = 0
+    missed: int = 0  # detector runs that missed a truth occurrence, summed
+    harmless_flagged: int = 0  # summed over runs
     # type -> [stable, flaky, never]; flaky entries are (scene, truth, hits)
     counts: dict[str, list[int]] = field(default_factory=dict)
     flaky: list[tuple[str, str, int]] = field(default_factory=list)
@@ -328,13 +333,21 @@ def context(
     seed: int,
     c: Context,
 ) -> None:
-    """Stability of each truth occurrence under reordered lines; a hit must overlap it."""
+    """Stability of each truth occurrence under reordered lines; a hit must overlap it.
+    Variants run in order (unscrolled first), so a name cache carries between them."""
     truth = Truth(case, terms)
     frame = _load(path, scale)
     w = frame.shape[1]
     base = ocr.recognize(frame)
     if not base:
         return
+    keep = [_norm(k) for k in case.get("keep", [])]
+    harmless = [
+        i
+        for i, ln in enumerate(base)
+        if not truth.find(ln.text)
+        and (any(k in _norm(ln.text) for k in keep) or truth.fuzzy(ln.text) is None)
+    ]
     rng = np.random.default_rng(seed)
     variants = [base] + [_scrolled(base, w, rng) for _ in range(_CONTEXT_RUNS)]
     hits: list[set[tuple[int, int, int]]] = []  # (base line, start, end)
@@ -344,10 +357,13 @@ def context(
         )
         det = detector.detect([lines[i].text for i in order])
         hits.append({(order[d.line_index], d.start, d.end) for d in det})
+        flagged = {j for j, _, _ in hits[-1]}
+        c.harmless_flagged += sum(i in flagged for i in harmless)
     c.runs += len(variants)
     for i, ln in enumerate(base):
         for s, t, a, b in truth.spans(ln.text):
             n = sum(any(j == i and lo < b and a < hi for j, lo, hi in h) for h in hits)
+            c.missed += len(variants) - n
             row = c.counts.setdefault(t, [0, 0, 0])
             if n == len(variants):
                 row[0] += 1
@@ -365,6 +381,11 @@ def print_context(c: Context) -> None:
     print(
         f"\ncontext ({c.runs} detector runs, {_CONTEXT_RUNS} scrolled variants per "
         f"image): truth occurrences stable {total[0]}, flaky {total[1]}, never {total[2]}"
+    )
+    per_run = c.harmless_flagged / c.runs if c.runs else 0.0
+    print(
+        f"  missed occurrence-runs {c.missed}; "
+        f"harmless lines flagged {per_run:.1f} per run"
     )
     for t, (st, fl, nv) in sorted(c.counts.items()):
         print(f"  {t:<14} stable {st:>3}  flaky {fl:>3}  never {nv:>3}")
@@ -503,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also re-run each image shifted by 1-3 px (stability counts)",
     )
+    ap.add_argument("--name-cache", choices=["off", "image", "session"], default="off")
+    ap.add_argument("--seed", type=int, default=0, help="--context seed offset")
     ap.add_argument(
         "--context",
         action="store_true",
@@ -539,7 +562,12 @@ def main(argv: list[str] | None = None) -> int:
         local = json.loads(_LOCAL_TRUTH.read_text())
         cases = cases + local["cases"]
         terms = terms + local.get("terms", [])
-    detector = _build_detector(args.detector, terms)
+    base = _build_detector(args.detector, terms)
+    session = NameCacheDetector(base) if args.name_cache == "session" else None
+
+    def fresh() -> Detector:
+        return base if args.name_cache == "off" else NameCacheDetector(base)
+
     ocr = TextRecognizer()
 
     results: list[SceneResult] = []
@@ -548,7 +576,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"skip {p.name}: no case {n}", file=sys.stderr)
             continue
         results.append(
-            evaluate(p, cases[n - 1], terms, ocr, detector, args.scale, args.save)
+            evaluate(
+                p,
+                cases[n - 1],
+                terms,
+                ocr,
+                session if session is not None else fresh(),
+                args.scale,
+                args.save,
+            )
         )
     if not results:
         return 2
@@ -557,13 +593,17 @@ def main(argv: list[str] | None = None) -> int:
         j = Jitter()
         for n, _, p in files:
             if 1 <= n <= len(cases):
-                jitter(p, ocr, detector, args.scale, j)
+                jitter(
+                    p, ocr, session if session is not None else fresh(), args.scale, j
+                )
         print_jitter(j)
     if args.context:
         c = Context()
         for k, (n, _, p) in enumerate(files):
             if 1 <= n <= len(cases):
-                context(p, cases[n - 1], terms, ocr, detector, args.scale, k, c)
+                context(
+                    p, cases[n - 1], terms, ocr, fresh(), args.scale, args.seed + k, c
+                )
         print_context(c)
     # Garbled truth left unmasked also fails.
     visible = any(r.leaks or any(not m for _, m in r.garbled) for r in results)

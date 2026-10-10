@@ -300,10 +300,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["float32", "float16"], default="float32")
     ap.add_argument("--perturb", action="store_true")
+    ap.add_argument(
+        "--name-cache",
+        action="store_true",
+        help="one session name cache across all cases, in file order",
+    )
     args = ap.parse_args(argv)
+    if args.name_cache and (args.detector != "union" or args.perturb):
+        ap.error("--name-cache needs --detector union and no --perturb")
     if not args.fixtures.exists():
         return run(args.fixtures)  # reports the missing file without loading a model
-    return run(args.fixtures, _build_detector(args, args.fixtures), args.perturb)
+    detector = _build_detector(args, args.fixtures)
+    if args.name_cache:
+        from .name_cache import NameCacheDetector
+
+        detector = NameCacheDetector(detector)
+    return run(args.fixtures, detector, args.perturb)
 
 
 if __name__ == "__main__":

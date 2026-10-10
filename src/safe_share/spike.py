@@ -62,6 +62,7 @@ from .capture_errors import StopDisposition
 from .config import load_config
 from .control_state import control_state, control_view
 from .detect import Detector, RuleConfig, RuleDetector, UnionDetector
+from .name_cache import NameCacheDetector
 from .ocr import TextRecognizer
 from .pipeline import FramePipeline, SessionState
 
@@ -270,6 +271,7 @@ class SafeShareSpike:
         self._rule_config = RuleConfig()
         self._detector_note = "rules only"
         self._names_off = False
+        self._name_cache: NameCacheDetector | None = None
         self._state = SessionState()
         self._pipeline: FramePipeline | None = None
         self._worker: threading.Thread | None = None
@@ -319,7 +321,16 @@ class SafeShareSpike:
     def _teardown_capture(self) -> None:
         if self._capture is not None:
             self._capture.stop()
+        self._clear_names()
         self._refresh_controls()
+
+    def _clear_names(self) -> None:
+        if self._name_cache is not None:
+            # Counts only: the names themselves are never logged.
+            n, refused = len(self._name_cache), self._name_cache.refused
+            self._name_cache.clear()
+            self._name_cache = None
+            print(f"[detect] name cache cleared ({n} entries, {refused} refused)")
 
     def request_toggle(self) -> None:
         live, stopped = self._state.snapshot()
@@ -359,6 +370,7 @@ class SafeShareSpike:
             self._presenter.show_neutral()
         if self._capture is not None:
             self._capture.stop()
+        self._clear_names()
         self._refresh_controls()
 
     def request_quit(self) -> None:
@@ -371,6 +383,7 @@ class SafeShareSpike:
         if self._pipeline is not None:
             # Here, not atexit: terminate_ calls C exit(), which skips Python's atexit.
             print(self._pipeline.timing_summary(), flush=True)
+        self._clear_names()
         AppHelper.stopEventLoop()
 
     def _build_windows(self) -> LayerPresenter:
@@ -506,7 +519,10 @@ class SafeShareSpike:
             f"[detect] rules + GLiNER on {where}, loaded in {time.monotonic() - t:.1f}s"
         )
         self._detector_note = "rules + GLiNER"
-        return UnionDetector(rules, GlinerDetector(model))
+        self._name_cache = NameCacheDetector(
+            UnionDetector(rules, GlinerDetector(model))
+        )
+        return self._name_cache
 
     def run(self) -> int:
         self._app = NSApplication.sharedApplication()
