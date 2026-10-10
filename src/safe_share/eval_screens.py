@@ -11,6 +11,8 @@ their OCR text only with --show-text. Nothing is written to disk unless
 They still show any leak the report lists; treat them like the input.
 --jitter re-runs each image shifted by 1-3 px and reports, as counts only, how
 often flagged lines are lost and how much pill grouping and label size change.
+--context shifts the OCR lines on one side of a random vertical cut, as if a pane
+scrolled, and counts truth occurrences flagged in all, some or none of the runs.
 Run: python -m safe_share.eval_screens [dir] [--detector rules|union] [--scale 0.5]
 """
 
@@ -88,13 +90,17 @@ class Truth:
 
     def find(self, text: str) -> list[tuple[str, str]]:
         """(truth string, type) for each exact occurrence in `text`."""
+        return [(s, t) for s, t, _, _ in self.spans(text)]
+
+    def spans(self, text: str) -> list[tuple[str, str, int, int]]:
+        """(truth string, type, start, end) for each exact occurrence in `text`."""
         if self._pat is None:
             return []
         out = []
         for m in self._pat.finditer(text):
             assert m.lastgroup is not None  # every alternative is a named group
             i = int(m.lastgroup[1:])
-            out.append((self.strings[i], self.types[i]))
+            out.append((self.strings[i], self.types[i], m.start(), m.end()))
         return out
 
     def fuzzy(self, text: str) -> str | None:
@@ -284,6 +290,91 @@ def jitter(
             j.edges.append(max(abs(a - b) for a, b in zip(p.rect, q.rect, strict=True)))
 
 
+_CONTEXT_RUNS = 10
+_CONTEXT_MAX_SHIFT = 6  # line heights
+
+
+@dataclass
+class Context:
+    runs: int = 0
+    # type -> [stable, flaky, never]; flaky entries are (scene, truth, hits)
+    counts: dict[str, list[int]] = field(default_factory=dict)
+    flaky: list[tuple[str, str, int]] = field(default_factory=list)
+    never: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _scrolled(lines: list[OcrLine], w: int, rng: np.random.Generator) -> list[OcrLine]:
+    """`lines` with those on one side of a random vertical cut moved vertically."""
+    lh = float(np.median([ln.box[3] - ln.box[1] for ln in lines]))
+    cut = rng.uniform(0.2, 0.8) * w
+    right = bool(rng.random() < 0.5)
+    dy = round(rng.choice((-1, 1)) * rng.integers(1, _CONTEXT_MAX_SHIFT + 1) * lh)
+    out = []
+    for ln in lines:
+        x0, y0, x1, y1 = ln.box
+        if ((x0 + x1) / 2 >= cut) == right:
+            ln = OcrLine(ln.text, (x0, y0 + dy, x1, y1 + dy), ln.confidence)
+        out.append(ln)
+    return out
+
+
+def context(
+    path: Path,
+    case: dict,
+    terms: list[str],
+    ocr: TextRecognizer,
+    detector: Detector,
+    scale: float,
+    seed: int,
+    c: Context,
+) -> None:
+    """Stability of each truth occurrence under reordered lines; a hit must overlap it."""
+    truth = Truth(case, terms)
+    frame = _load(path, scale)
+    w = frame.shape[1]
+    base = ocr.recognize(frame)
+    if not base:
+        return
+    rng = np.random.default_rng(seed)
+    variants = [base] + [_scrolled(base, w, rng) for _ in range(_CONTEXT_RUNS)]
+    hits: list[set[tuple[int, int, int]]] = []  # (base line, start, end)
+    for lines in variants:
+        order = sorted(
+            range(len(lines)), key=lambda i: (lines[i].box[1], lines[i].box[0])
+        )
+        det = detector.detect([lines[i].text for i in order])
+        hits.append({(order[d.line_index], d.start, d.end) for d in det})
+    c.runs += len(variants)
+    for i, ln in enumerate(base):
+        for s, t, a, b in truth.spans(ln.text):
+            n = sum(any(j == i and lo < b and a < hi for j, lo, hi in h) for h in hits)
+            row = c.counts.setdefault(t, [0, 0, 0])
+            if n == len(variants):
+                row[0] += 1
+            elif n:
+                row[1] += 1
+                c.flaky.append((path.stem, s, n))
+            else:
+                row[2] += 1
+                c.never.append((path.stem, s))
+
+
+def print_context(c: Context) -> None:
+    # Truth strings are fixture text, not OCR output.
+    total = [sum(col) for col in zip(*c.counts.values())] or [0, 0, 0]
+    print(
+        f"\ncontext ({c.runs} detector runs, {_CONTEXT_RUNS} scrolled variants per "
+        f"image): truth occurrences stable {total[0]}, flaky {total[1]}, never {total[2]}"
+    )
+    for t, (st, fl, nv) in sorted(c.counts.items()):
+        print(f"  {t:<14} stable {st:>3}  flaky {fl:>3}  never {nv:>3}")
+    runs = _CONTEXT_RUNS + 1
+    for name, s, n in c.flaky:
+        print(f"  - flaky {name}: {s!r} {n}/{runs}")
+    for name, s in c.never:
+        print(f"  - never {name}: {s!r}")
+
+
 def print_jitter(j: Jitter) -> None:
     lost = j.lost_unflagged + j.lost_split
     print(
@@ -413,6 +504,11 @@ def main(argv: list[str] | None = None) -> int:
         help="also re-run each image shifted by 1-3 px (stability counts)",
     )
     ap.add_argument(
+        "--context",
+        action="store_true",
+        help="also re-run detection with one pane scrolled (context stability)",
+    )
+    ap.add_argument(
         "--save",
         type=Path,
         help="write masked screenshots here; they may still show leaked text",
@@ -463,6 +559,12 @@ def main(argv: list[str] | None = None) -> int:
             if 1 <= n <= len(cases):
                 jitter(p, ocr, detector, args.scale, j)
         print_jitter(j)
+    if args.context:
+        c = Context()
+        for k, (n, _, p) in enumerate(files):
+            if 1 <= n <= len(cases):
+                context(p, cases[n - 1], terms, ocr, detector, args.scale, k, c)
+        print_context(c)
     # Garbled truth left unmasked also fails.
     visible = any(r.leaks or any(not m for _, m in r.garbled) for r in results)
     return 1 if visible else 0
