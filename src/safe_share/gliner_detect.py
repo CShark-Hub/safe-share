@@ -1,10 +1,12 @@
 """GLiNER person-name detection. Needs the `ml` extra; loads from the
-local cache only, except `fetch_model()`."""
+local cache only. Downloads run only in a child process (`fetch_in_subprocess`)."""
 
 from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,7 +20,9 @@ MODEL_VARIANT = "fp16"  # safetensors; the repo default is a pickle
 BACKBONE_ID = "microsoft/deberta-v3-small"
 BACKBONE_REVISION = "a36c739020e01763fe789b4b85e2df55d6180012"
 
-LABELS = ("person",)  # organization also hits public brands and UI; clients go in `terms`
+LABELS = (
+    "person",
+)  # organization also hits public brands and UI; clients go in `terms`
 # Words as gliner counts them (its WhitespaceTokenSplitter): punctuation is a word.
 _WORD = re.compile(r"\w+(?:[-_]\w+)*|\S")
 # Far under gliner's 768-word max_len, which truncates (a silent miss); small
@@ -27,6 +31,19 @@ MAX_CHUNK_WORDS = 75
 # The backbone has 512 positions; the label prompt takes 7 subwords.
 MAX_CHUNK_SUBWORDS = 480
 THRESHOLD = 0.7  # measured on fixtures/detect/names.json
+FETCH_TIMEOUT = 900.0  # seconds
+# Read before _force_offline overwrites it: a user's own offline setting wins.
+_USER_OFFLINE = os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_ONLINE_BLOCKERS = (
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "HF_HUB_DISABLE_PROGRESS_BARS",
+)
 
 
 class GlinerModel(Protocol):
@@ -173,6 +190,9 @@ def _check_cache() -> None:
 
     if not constants.HF_HUB_OFFLINE:
         raise ModelUnavailable("offline mode is not active")
+    # gliner loads a relative directory named like the repo id before the cache.
+    if Path(MODEL_ID).exists():
+        raise ModelUnavailable(f"a local ./{MODEL_ID} would shadow the cached model")
     weights = (
         Path(HF_HUB_CACHE)
         / f"models--{MODEL_ID.replace('/', '--')}"
@@ -262,8 +282,44 @@ def load_best() -> tuple[Any, str]:
     raise ModelUnavailable("model did not run on any device")
 
 
+def model_cached() -> bool:
+    """True if the pinned model is in the local cache. Forces offline mode here."""
+    _force_offline()
+    try:
+        _check_cache()
+    except ModelUnavailable:
+        return False
+    return True
+
+
+def fetch_in_subprocess(timeout: float = FETCH_TIMEOUT) -> bool:
+    """Download the pinned model in a child process, so this one never goes online.
+    True only if the cache then holds it."""
+    if _USER_OFFLINE:
+        print("[detect] HF_HUB_OFFLINE is set: not downloading")
+        return False
+    env = {k: v for k, v in os.environ.items() if k not in _ONLINE_BLOCKERS}
+    try:
+        done = subprocess.run(
+            # -P: the current directory must not shadow installed modules.
+            [sys.executable, "-P", "-m", "safe_share.gliner_detect", "--fetch"],
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0 and model_cached()
+
+
 def fetch_model() -> None:
     """Download the pinned model into the Hugging Face cache (uses network)."""
     from gliner import GLiNER
 
     GLiNER.from_pretrained(MODEL_ID, revision=MODEL_REVISION, variant=MODEL_VARIANT)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--fetch"]:
+        raise SystemExit("usage: python -m safe_share.gliner_detect --fetch")
+    fetch_model()

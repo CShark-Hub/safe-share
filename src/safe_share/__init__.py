@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from safe-share!")
+"""Safe Share: on-device redaction of a live screen share."""

@@ -206,3 +206,53 @@ def test_real_model_loads_and_runs_with_the_network_blocked(
     dets = GlinerDetector(load_model()).detect(texts)
     assert (0, "Priya Venkat", "person") in _spans(dets, texts)
     assert all(d.line_index == 0 for d in dets)
+
+
+def test_fetch_runs_online_only_in_the_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    from safe_share import gliner_detect
+
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: list[str], env: dict[str, str], **_: Any) -> Any:
+        seen["env"] = env
+        return type("Done", (), {"returncode": 0})()
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(gliner_detect, "_USER_OFFLINE", False)
+    monkeypatch.setattr(gliner_detect.subprocess, "run", fake_run)
+    monkeypatch.setattr(gliner_detect, "model_cached", lambda: True)
+    assert gliner_detect.fetch_in_subprocess()
+    assert "HF_HUB_OFFLINE" not in seen["env"]
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+
+
+@pytest.mark.parametrize("outcome", ["exit1", "timeout", "not_cached"])
+def test_failed_fetch_reports_failure(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    import subprocess
+
+    from safe_share import gliner_detect
+
+    def fake_run(cmd: list[str], **kw: Any) -> Any:
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        return type("Done", (), {"returncode": 1 if outcome == "exit1" else 0})()
+
+    monkeypatch.setattr(gliner_detect, "_USER_OFFLINE", False)
+    monkeypatch.setattr(gliner_detect.subprocess, "run", fake_run)
+    monkeypatch.setattr(gliner_detect, "model_cached", lambda: False)
+    assert not gliner_detect.fetch_in_subprocess()
+
+
+def test_user_offline_setting_blocks_the_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safe_share import gliner_detect
+
+    def fake_run(*_: Any, **__: Any) -> Any:
+        raise AssertionError("must not start a download")
+
+    monkeypatch.setattr(gliner_detect, "_USER_OFFLINE", True)
+    monkeypatch.setattr(gliner_detect.subprocess, "run", fake_run)
+    assert not gliner_detect.fetch_in_subprocess()

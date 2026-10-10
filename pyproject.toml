@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-safe-share = "safe_share:main"
+safe-share = "safe_share.app:main"
 
 [project.optional-dependencies]
 ml = [

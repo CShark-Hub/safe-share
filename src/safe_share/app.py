@@ -4,11 +4,12 @@ share, plus a separate Pause/Resume/Stop window.
 Scheduling and the privacy invariants live in `pipeline.py`; this module is the
 AppKit publisher and the window/control wiring.
 
-Run:  python -m safe_share.spike   (needs Screen Recording permission)
+Run:  safe-share   (needs Screen Recording permission; downloads the model once)
 """
 
 from __future__ import annotations
 
+import argparse
 import signal
 import sys
 import threading
@@ -254,7 +255,7 @@ class Controls(NSObject):
         self._app._refresh_controls()
 
 
-class SafeShareSpike:
+class SafeShareApp:
     """Wires capture, pipeline, presenter and controls into one running app."""
 
     def __init__(self) -> None:
@@ -524,7 +525,31 @@ class SafeShareSpike:
         )
         return self._name_cache
 
+    def _fetch_model_if_missing(self) -> None:
+        """One-time model download, before any window or capture exists. A failure
+        leaves the model missing, so `_build_detector` falls back to rules only."""
+        try:
+            from .gliner_detect import fetch_in_subprocess, model_cached
+
+            if model_cached():
+                return
+        except ImportError:
+            return  # reported by _build_detector
+        print("[detect] GLiNER model not cached: downloading once, before capture")
+        if not fetch_in_subprocess():
+            print("[detect] model download failed")
+
     def run(self) -> int:
+        config = load_config()
+        self._rule_config = config.rules
+        print(
+            f"[config] source={config.source} emails={config.rules.emails} "
+            f"credentials={config.rules.credentials} "
+            f"terms={len(config.rules.terms)} gliner={config.gliner}"
+        )
+        if config.gliner:
+            self._fetch_model_if_missing()
+
         self._app = NSApplication.sharedApplication()
         # Regular policy before capture so this process is self-excludable.
         self._app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
@@ -542,13 +567,6 @@ class SafeShareSpike:
         presenter = self._build_windows()
         self._app.activate()
 
-        config = load_config()
-        self._rule_config = config.rules
-        print(
-            f"[config] source={config.source} emails={config.rules.emails} "
-            f"credentials={config.rules.credentials} "
-            f"terms={len(config.rules.terms)} gliner={config.gliner}"
-        )
         # Before capture starts, so the load stays outside the watchdog budget.
         detector = self._build_detector(config.gliner)
         self._shown_view = None  # the tooltip carries the detector note
@@ -602,8 +620,27 @@ class SafeShareSpike:
         return 0
 
 
-def main() -> int:
-    return SafeShareSpike().run()
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="safe-share", description="Redact a live screen for screen sharing."
+    )
+    ap.add_argument(
+        "--fetch-model",
+        action="store_true",
+        help="download the GLiNER model (uses network) and exit",
+    )
+    args = ap.parse_args(argv)
+    if args.fetch_model:
+        try:
+            from .gliner_detect import fetch_in_subprocess, model_cached
+
+            ok = model_cached() or fetch_in_subprocess()
+        except ImportError:
+            print("GLiNER not installed: uv sync --extra ml", file=sys.stderr)
+            return 1
+        print("model ready" if ok else "model download failed")
+        return 0 if ok else 1
+    return SafeShareApp().run()
 
 
 if __name__ == "__main__":

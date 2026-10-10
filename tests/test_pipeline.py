@@ -595,7 +595,7 @@ def test_older_slot_frames_are_dropped():
     ],
 )
 def test_should_deliver(accepted, seq, last_seq, expected):
-    from safe_share.spike import should_deliver
+    from safe_share.app import should_deliver
 
     assert should_deliver(accepted, seq, last_seq) is expected
 

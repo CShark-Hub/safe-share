@@ -1,7 +1,7 @@
 """ScreenCaptureKit display capture: produces raw BGRA frames from one display.
 
 Excludes this process's own windows so the output window is not recursively
-captured. Masking, scheduling and the neutral screen live in `spike.py`.
+captured. Scheduling is in `pipeline.py`, masking in `redact.py`, windows in `app.py`.
 """
 
 from __future__ import annotations
