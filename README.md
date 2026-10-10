@@ -30,6 +30,14 @@ view or terminal can show another client's name, a colleague's email or an API k
 That is an NDA or GDPR problem in a single frame, and nobody can watch every pixel
 while presenting.
 
+Where it helps:
+
+- **Sprint review:** a PM walks a client through Jira while a chat with another client
+  is open next to it.
+- **Debugging with a client:** a developer shares an admin panel or a terminal with
+  customer emails, tokens and connection strings on screen.
+- **Sales demo:** a CRM full of other clients' names, deals and contacts.
+
 ## How it works
 
 Safe Share captures your screen, finds sensitive text and covers it before anything is
@@ -55,6 +63,12 @@ flowchart LR
 
 ## Why AI
 
+Safe Share runs two AI models on the Mac:
+
+- **Apple Vision text recognition** reads every line of text on screen, with its
+  position, so it can be covered exactly.
+- **GLiNER** finds the names in that text.
+
 Emails and API keys have a fixed shape, so rules find them. Names don't. A regex cannot
 tell "Hana" from "Help".
 
@@ -73,8 +87,7 @@ Results on synthetic test screens (8 scenes, 17 screenshots):
 | **+ GLiNER + session memory** | **97%** | **5** | 15 / 645 |
 
 Emails and credentials: 100% in all three. Detection adds about 90 ms per frame.
-These screens were also used during development, so treat the numbers as a fixture
-result, not general recall. Details: [docs/EVALUATION.md](docs/EVALUATION.md).
+Full method and results: [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ## Quickstart
 
@@ -88,7 +101,8 @@ uv run safe-share        # first run downloads the GLiNER model once
 ```
 
 On first run macOS asks for **Screen Recording** permission for your terminal. Grant it,
-then run the command again.
+then run the command again. If it still asks, quit and reopen the terminal: macOS
+applies the permission only to newly started apps.
 
 ## Usage
 
@@ -119,6 +133,13 @@ gliner = true                                 # AI name detection
   changes.
 - macOS only. Tested with Microsoft Teams window sharing.
 
+## What's next
+
+- Test with Zoom and Google Meet window sharing.
+- Mask only the name inside a line, not the whole line.
+- More entity types: phone numbers, IBANs, addresses.
+- A signed macOS app bundle with its own name and icon.
+
 ## How it was built
 
 - **Idea and first plan:** brainstormed with GPT-6 Astra.
@@ -129,6 +150,17 @@ gliner = true                                 # AI name detection
   The privacy rules are written down for the agents and checked by the review agents.
 
 ## Extending
+
+| Path | What it does |
+|---|---|
+| `src/safe_share/app.py` | Windows, controls, startup |
+| `src/safe_share/capture.py` | Screen capture (ScreenCaptureKit) |
+| `src/safe_share/pipeline.py` | Frame scheduling and the privacy guarantees |
+| `src/safe_share/ocr.py` | Apple Vision text recognition |
+| `src/safe_share/detect.py` | Rule-based detection |
+| `src/safe_share/gliner_detect.py` | GLiNER name detection |
+| `src/safe_share/name_cache.py` | Session name memory |
+| `src/safe_share/redact.py` | Opaque labels |
 
 - **New detector:** implement `detect(texts) -> list[Detection]` from
   [`detect.py`](src/safe_share/detect.py) and combine it with `UnionDetector`.
