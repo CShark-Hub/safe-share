@@ -173,6 +173,7 @@ Security issues: see [SECURITY.md](SECURITY.md).
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+Dependencies and models: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 Copyright (c) 2026 CSHARK Commit Hackathon Contributors
 
