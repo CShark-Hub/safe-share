@@ -1,7 +1,9 @@
 [project]
 name = "safe-share"
 version = "0.1.0"
-description = "Add your description here"
+description = "On-device redaction of a live screen for screen sharing on macOS"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 readme = "README.md"
 authors = [
     { name = "Krzysiek Kulig" }
