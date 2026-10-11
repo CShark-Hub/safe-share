@@ -149,6 +149,8 @@ gliner = true                                 # AI name detection
   and in dedicated agents for ML design, macOS APIs, code review and security review.
   The privacy rules are written down for the agents and checked by the review agents.
 
+Pitch deck: [pitch/safe-share-pitch.pdf](pitch/safe-share-pitch.pdf).
+
 ## Extending
 
 | Path | What it does |
