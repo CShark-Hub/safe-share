@@ -19,6 +19,7 @@ import numpy as np
 import objc
 import Quartz
 from AppKit import (
+    NSAffineTransform,
     NSApplication,
     NSApplicationActivationPolicyRegular,
     NSAttributedString,
@@ -34,12 +35,14 @@ from AppKit import (
     NSFontWeightRegular,
     NSFontWeightSemibold,
     NSForegroundColorAttributeName,
+    NSGradient,
     NSGraphicsContext,
     NSImage,
     NSImageSymbolConfiguration,
     NSLayoutAttributeLeading,
     NSMakePoint,
     NSMakeRect,
+    NSMakeSize,
     NSMaxX,
     NSMaxY,
     NSMutableAttributedString,
@@ -168,6 +171,54 @@ def _draw_centered(text, weight, size, white, cx, baseline):
     }
     s = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
     s.drawAtPoint_(NSMakePoint(cx - s.size().width / 2, baseline))
+
+
+# docs/logo.svg in its 128-unit space, y down: (x, y, w, h, corner radius, colour).
+_ICON_GRADIENT = (0x7D7AFF, 0x4B49D6)
+_ICON_SHAPES = (
+    (20, 28, 88, 72, 10, 0xFFFFFF),
+    (28, 35, 6, 6, 3, 0xD1D1D6),
+    (37, 35, 6, 6, 3, 0xD1D1D6),
+    (46, 35, 6, 6, 3, 0xD1D1D6),
+    (30, 49, 56, 7, 3.5, 0xD1D1D6),
+    (28, 62, 72, 15, 7.5, 0x2C2C2E),
+    (36, 68, 22, 3, 1.5, 0xAEAEB2),
+    (30, 83, 44, 7, 3.5, 0xD1D1D6),
+)
+_ICON_ART = 824 / 1024  # macOS icon grid: artwork inset within the 1024 canvas
+
+
+def _srgb(rgb: int):
+    r, g, b = (rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(r / 255, g / 255, b / 255, 1.0)
+
+
+def _rounded(x, y, w, h, radius):
+    return NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(x, y, w, h), radius, radius
+    )
+
+
+def _app_icon():
+    """The logo as a Dock icon image."""
+
+    def draw(rect):
+        side = rect.size.width
+        t = NSAffineTransform.transform()
+        t.translateXBy_yBy_(side * (1 - _ICON_ART) / 2, side * (1 - _ICON_ART) / 2)
+        t.scaleBy_(side * _ICON_ART / 128)
+        t.concat()
+        start, end = (_srgb(c) for c in _ICON_GRADIENT)
+        gradient = NSGradient.alloc().initWithStartingColor_endingColor_(start, end)
+        gradient.drawInBezierPath_angle_(_rounded(0, 0, 128, 128, 28), 45)
+        for x, y, w, h, radius, rgb in _ICON_SHAPES:
+            _srgb(rgb).setFill()
+            _rounded(x, y, w, h, radius).fill()
+        return True
+
+    return NSImage.imageWithSize_flipped_drawingHandler_(
+        NSMakeSize(1024, 1024), True, draw
+    )
 
 
 class LayerPresenter:
@@ -553,6 +604,7 @@ class SafeShareApp:
         self._app = NSApplication.sharedApplication()
         # Regular policy before capture so this process is self-excludable.
         self._app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+        self._app.setApplicationIconImage_(_app_icon())
 
         if not Quartz.CGPreflightScreenCaptureAccess():
             Quartz.CGRequestScreenCaptureAccess()  # prompts once; grant needs relaunch
