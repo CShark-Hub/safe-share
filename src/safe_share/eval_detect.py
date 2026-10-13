@@ -273,22 +273,29 @@ def _print_perturbed(r: Report) -> None:
         print(f"  - {x}")
 
 
-def _build_detector(args: argparse.Namespace, fixtures: Path) -> Detector | None:
+def _build_detector(
+    args: argparse.Namespace, fixtures: Path
+) -> tuple[Detector | None, frozenset[str]]:
+    """(detector, common words for the name cache)."""
     if args.detector == "rules":
-        return None
-    from .gliner_detect import GlinerDetector, load_model
+        return None, frozenset()
+    from .gliner_detect import GlinerDetector, common_words, load_model
 
+    model = load_model(device=args.device, dtype=args.dtype)
     gliner = GlinerDetector(
-        load_model(device=args.device, dtype=args.dtype),
+        model,
         threshold=args.threshold,
         lines_per_chunk=args.lines_per_chunk,
     )
     if args.detector == "gliner":
-        return gliner
+        return gliner, common_words(model)
     terms = (
         json.loads(fixtures.read_text()).get("terms", []) if fixtures.exists() else []
     )
-    return UnionDetector(RuleDetector(RuleConfig(terms=terms)), gliner)
+    return (
+        UnionDetector(RuleDetector(RuleConfig(terms=terms)), gliner),
+        common_words(model),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -310,11 +317,11 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--name-cache needs --detector union and no --perturb")
     if not args.fixtures.exists():
         return run(args.fixtures)  # reports the missing file without loading a model
-    detector = _build_detector(args, args.fixtures)
+    detector, common = _build_detector(args, args.fixtures)
     if args.name_cache:
         from .name_cache import NameCacheDetector
 
-        detector = NameCacheDetector(detector)
+        detector = NameCacheDetector(detector, common)
     return run(args.fixtures, detector, args.perturb)
 
 

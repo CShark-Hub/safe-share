@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+from itertools import pairwise
 
 from .detect import Detection, Detector, _fold, _normalize
 
@@ -12,20 +13,32 @@ _EDGE_PUNCT = re.compile(r"^\W+|\W+$")
 
 
 def _name_word(w: str) -> bool:
-    """A word that may match on its own: alphabetic, 3+ letters, capitalised, not all caps."""
-    return w.isalpha() and len(w) >= 3 and w[0].isupper() and not w.isupper()
+    """A word that may match on its own: alphabetic, 3+ letters, capitalised, no two capitals in a row."""
+    return (
+        w.isalpha()
+        and len(w) >= 3
+        and w[0].isupper()
+        and not any(a.isupper() and b.isupper() for a, b in pairwise(w))
+    )
 
 
 class NameCacheDetector:
     """Wraps a detector; GLiNER person spans are remembered for the session.
 
     Multi-word names match case-insensitively; single words only where the line
-    has them capitalised. Entries live in memory only, are never logged, and go
-    on `clear()`. A full cache refuses new names rather than evicting old ones.
+    has them capitalised; words in `common` only as part of a multi-word name.
+    Entries live in memory only, are never logged, and go on `clear()`. A full
+    cache refuses new names rather than evicting old ones.
     """
 
-    def __init__(self, inner: Detector, max_names: int = MAX_NAMES) -> None:
+    def __init__(
+        self,
+        inner: Detector,
+        common: frozenset[str] = frozenset(),
+        max_names: int = MAX_NAMES,
+    ) -> None:
         self._inner = inner
+        self._common = common
         self._max = max_names
         self._lock = threading.Lock()
         self._phrases: set[str] = set()  # folded, single-spaced, 2+ words
@@ -85,7 +98,13 @@ class NameCacheDetector:
         words = _EDGE_PUNCT.sub("", span).split()
         new_phrases = {_fold(" ".join(words))} if len(words) > 1 else set()
         new_words = (
-            {w.casefold() for w in words if _name_word(w)} if len(words) <= 3 else set()
+            {
+                w.casefold()
+                for w in words
+                if _name_word(w) and w.casefold() not in self._common
+            }
+            if len(words) <= 3
+            else set()
         )
         new_phrases -= self._phrases
         new_words -= self._words
