@@ -56,6 +56,48 @@ def test_single_word_is_not_matched_through_ocr_folding() -> None:
     assert cache.detect(["All set"]) == []  # folds to "all", like "Ali"
 
 
+def test_common_word_is_remembered_only_inside_its_full_name() -> None:
+    model = FlakyModel("Grace Whitfield", "After", "GLiNER")
+    cache = NameCacheDetector(model, frozenset({"grace", "after"}))
+    cache.detect(["Grace Whitfield", "After", "+ GLiNER"])
+    model.on = False
+    assert _covered(
+        cache.detect(["re: grace whitfield"]), "re: grace whitfield", "grace"
+    )
+    for text in ("Grace", "After the call", "+ GLiNER"):
+        assert cache.detect([text]) == []
+
+
+def test_rare_name_is_still_remembered_alone() -> None:
+    model = FlakyModel("Kasia", "PriyaVenkat")
+    cache = NameCacheDetector(model, frozenset({"after", "rules"}))
+    cache.detect(["Kasia", "Meeting with PriyaVenkat"])
+    model.on = False
+    for text, word in (("Kasia", "Kasia"), ("Re: PriyaVenkat", "PriyaVenkat")):
+        assert _covered(cache.detect([text]), text, word)
+
+
+def test_common_words_compares_lowercase_and_capitalised_scores() -> None:
+    import json
+    from types import SimpleNamespace
+
+    from safe_share.gliner_detect import common_words
+
+    vocab = [["▁after", -5.0], ["▁After", -8.0], ["▁kasia", -12.0], ["▁Kasia", -9.0]]
+    vocab += [["▁rules", -7.0], ["ing", -3.0], ["▁GLiNER", -11.0]]
+    spec = json.dumps({"model": {"type": "Unigram", "vocab": vocab}})
+    backend = SimpleNamespace(to_str=lambda: spec)
+    tok = SimpleNamespace(backend_tokenizer=backend)
+    model = SimpleNamespace(data_processor=SimpleNamespace(transformer_tokenizer=tok))
+    assert common_words(model) == frozenset({"after", "rules"})
+
+
+def test_unreadable_tokenizer_gives_no_common_words() -> None:
+    from safe_share.gliner_detect import common_words
+
+    assert common_words(object()) == frozenset()
+
+
 def test_clear_forgets_and_admits_nothing_after() -> None:
     model = FlakyModel()
     cache = NameCacheDetector(model)

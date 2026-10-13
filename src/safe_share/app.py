@@ -555,7 +555,12 @@ class SafeShareApp:
         if not use_gliner:
             return rules
         try:
-            from .gliner_detect import GlinerDetector, ModelUnavailable, load_best
+            from .gliner_detect import (
+                GlinerDetector,
+                ModelUnavailable,
+                common_words,
+                load_best,
+            )
 
             t = time.monotonic()
             model, where = load_best()
@@ -571,8 +576,10 @@ class SafeShareApp:
             f"[detect] rules + GLiNER on {where}, loaded in {time.monotonic() - t:.1f}s"
         )
         self._detector_note = "rules + GLiNER"
+        common = common_words(model)
+        print(f"[detect] name cache skips {len(common)} common words")
         self._name_cache = NameCacheDetector(
-            UnionDetector(rules, GlinerDetector(model))
+            UnionDetector(rules, GlinerDetector(model)), common
         )
         return self._name_cache
 

@@ -496,15 +496,16 @@ def print_report(results: list[SceneResult], show_text: bool = False) -> None:
     )
 
 
-def _build_detector(kind: str, terms: list[str]) -> Detector:
+def _build_detector(kind: str, terms: list[str]) -> tuple[Detector, frozenset[str]]:
+    """(detector, common words for the name cache)."""
     rules = RuleDetector(RuleConfig(terms=terms))
     if kind == "rules":
-        return rules
-    from .gliner_detect import GlinerDetector, load_best
+        return rules, frozenset()
+    from .gliner_detect import GlinerDetector, common_words, load_best
 
     model, where = load_best()
     print(f"[detect] GLiNER on {where}", file=sys.stderr)
-    return UnionDetector(rules, GlinerDetector(model))
+    return UnionDetector(rules, GlinerDetector(model)), common_words(model)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -562,11 +563,11 @@ def main(argv: list[str] | None = None) -> int:
         local = json.loads(_LOCAL_TRUTH.read_text())
         cases = cases + local["cases"]
         terms = terms + local.get("terms", [])
-    base = _build_detector(args.detector, terms)
-    session = NameCacheDetector(base) if args.name_cache == "session" else None
+    base, common = _build_detector(args.detector, terms)
+    session = NameCacheDetector(base, common) if args.name_cache == "session" else None
 
     def fresh() -> Detector:
-        return base if args.name_cache == "off" else NameCacheDetector(base)
+        return base if args.name_cache == "off" else NameCacheDetector(base, common)
 
     ocr = TextRecognizer()
 

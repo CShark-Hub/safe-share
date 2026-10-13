@@ -3,6 +3,7 @@ local cache only. Downloads run only in a child process (`fetch_in_subprocess`).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -157,6 +158,28 @@ def _subword_counter(model: object) -> Callable[[list[list[str]]], list[int]] | 
         return [len(x) for x in ids]
 
     return count
+
+
+def common_words(model: object) -> frozenset[str]:
+    """Words the unigram vocab scores higher lowercase than capitalised (or has
+    only lowercase); empty if the tokenizer cannot be read."""
+    tok = getattr(getattr(model, "data_processor", None), "transformer_tokenizer", None)
+    try:
+        spec = json.loads(tok.backend_tokenizer.to_str())["model"]
+        if spec["type"] != "Unigram":
+            return frozenset()
+        score = {piece: s for piece, s in spec["vocab"]}
+        # "▁" marks a word start in SentencePiece; other pieces are word fragments.
+        return frozenset(
+            piece[1:].casefold()
+            for piece, s in score.items()
+            if piece.startswith("▁")
+            and piece[1:].isalpha()
+            and piece[1:].islower()
+            and s > score.get("▁" + piece[1:].capitalize(), float("-inf"))
+        )
+    except Exception:  # noqa: BLE001 - unreadable tokenizer
+        return frozenset()
 
 
 def _split_to_lines(
