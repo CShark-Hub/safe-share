@@ -94,8 +94,8 @@ Full method and results: [docs/EVALUATION.md](docs/EVALUATION.md).
 Tested on macOS 27, Apple silicon. Needs [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone <repo-url>
-cd <repo-dir>
+git clone https://github.com/CShark-Hub/safe-share.git
+cd safe-share
 uv sync --extra ml
 uv run safe-share        # first run downloads the GLiNER model once
 ```
